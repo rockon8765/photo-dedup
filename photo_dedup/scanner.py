@@ -2,48 +2,88 @@
 掃描模組 — 找出資料夾中的重複檔案
 
 流程：
-  1. 用 os.scandir 快速收集所有檔案
-  2. 非圖片檔按大小分組預篩（大小不同不可能重複）
-  3. 計算 hash（圖片: 像素 MD5 / 其他: 全檔 MD5）
-  4. 產出報告 + 待刪清單
+  1. 驗證輸入參數
+  2. 用 os.walk (遞迴) 或 os.scandir (平面) 收集所有檔案
+  3. 非圖片檔按大小分組預篩（大小不同不可能重複）
+  4. 計算 hash（圖片: 像素 MD5 / 其他: 全檔 MD5）
+  5. 產出 JSON 結構化報告 + 可讀文字報告
 """
 
+import json
 import os
 import sys
 import time
 from collections import defaultdict
-from pathlib import Path
 
 from .hasher import IMAGE_EXTENSIONS, compute_hash, init_heic_support
 from .utils import format_size
 
-# 掃描時要排除的檔案
-SKIP_NAMES = {
-    'find_duplicates.py', 'delete_duplicates.py',
-    'duplicates_report.txt', 'duplicates_to_delete.txt',
-    'scan.py', 'clean.py',
-}
+
+def validate_scan_args(target_dir: str, output_dir: str):
+    """驗證掃描參數，失敗時直接 sys.exit"""
+    if not os.path.exists(target_dir):
+        print(f"❌ Directory not found: {target_dir}")
+        sys.exit(1)
+
+    if not os.path.isdir(target_dir):
+        print(f"❌ Not a directory: {target_dir}")
+        sys.exit(1)
+
+    if not os.access(target_dir, os.R_OK):
+        print(f"❌ No read permission: {target_dir}")
+        sys.exit(1)
+
+    # 確保 output_dir 可寫
+    os.makedirs(output_dir, exist_ok=True)
+    if not os.access(output_dir, os.W_OK):
+        print(f"❌ No write permission: {output_dir}")
+        sys.exit(1)
 
 
-def collect_files(target_dir: str) -> list[tuple[str, int, str]]:
+def collect_files(
+    target_dir: str,
+    recursive: bool = True,
+) -> list[tuple[str, int, str]]:
     """
     收集目標資料夾中的所有檔案。
 
+    Args:
+        target_dir: 目標資料夾
+        recursive: 是否遞迴掃描子資料夾
+
     Returns:
-        list of (path, size, ext)
+        list of (absolute_path, size, ext)
     """
+    skip_dirs = {'_duplicates_backup', '.git', '__pycache__'}
     all_files = []
-    for entry in os.scandir(target_dir):
-        if entry.is_file(follow_symlinks=False):
-            name = entry.name
-            if name in SKIP_NAMES or name.startswith('_duplicates_backup') or name.startswith('.'):
-                continue
-            try:
-                stat = entry.stat()
-                ext = os.path.splitext(name)[1].lower()
-                all_files.append((entry.path, stat.st_size, ext))
-            except OSError:
-                pass
+
+    if recursive:
+        for dirpath, dirnames, filenames in os.walk(target_dir):
+            # 跳過特定目錄
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in skip_dirs and not d.startswith('.')
+            ]
+            for name in filenames:
+                if name.startswith('.'):
+                    continue
+                filepath = os.path.join(dirpath, name)
+                try:
+                    size = os.path.getsize(filepath)
+                    ext = os.path.splitext(name)[1].lower()
+                    all_files.append((filepath, size, ext))
+                except OSError:
+                    pass
+    else:
+        for entry in os.scandir(target_dir):
+            if entry.is_file(follow_symlinks=False) and not entry.name.startswith('.'):
+                try:
+                    stat = entry.stat()
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    all_files.append((entry.path, stat.st_size, ext))
+                except OSError:
+                    pass
+
     return all_files
 
 
@@ -119,77 +159,128 @@ def compute_hashes(
     return hash_groups, size_map
 
 
-def generate_report(
-    dup_groups: dict,
-    size_map: dict,
+def build_groups(
+    dup_groups: dict[str, list[str]],
+    size_map: dict[str, int],
+    target_dir: str,
+) -> list[dict]:
+    """
+    建構重複組的結構化資料。
+
+    Returns:
+        list of group dicts, 每個包含 keep 和 delete 資訊
+    """
+    groups = []
+
+    for h, files in sorted(dup_groups.items(), key=lambda x: -len(x[1])):
+        files_with_size = [(f, size_map.get(f, 0)) for f in files]
+        files_with_size.sort(key=lambda x: -x[1])  # 最大的排前面
+
+        keep_path, keep_size = files_with_size[0]
+        delete_files = files_with_size[1:]
+
+        group = {
+            "hash": h,
+            "keep": {
+                "path": os.path.relpath(keep_path, target_dir),
+                "size": keep_size,
+            },
+            "delete": [
+                {
+                    "path": os.path.relpath(dp, target_dir),
+                    "size": ds,
+                }
+                for dp, ds in delete_files
+            ],
+        }
+        groups.append(group)
+
+    return groups
+
+
+def write_json_report(
+    groups: list[dict],
     total_files: int,
     target_dir: str,
     output_dir: str,
-) -> tuple[int, int, list]:
-    """
-    產出報告和待刪清單。
+    settings: dict,
+):
+    """寫入 JSON 結構化報告"""
+    total_dup = sum(len(g["delete"]) for g in groups)
+    total_save = sum(
+        sum(d["size"] for d in g["delete"])
+        for g in groups
+    )
 
-    Returns:
-        (total_dup_files, total_saveable, to_delete_paths)
-    """
-    total_dup_files = 0
-    total_saveable = 0
-    to_delete = []
+    report = {
+        "version": "1.1.0",
+        "scan_time": time.strftime('%Y-%m-%d %H:%M:%S'),
+        "target_dir": target_dir,
+        "settings": settings,
+        "summary": {
+            "total_files": total_files,
+            "duplicate_groups": len(groups),
+            "deletable_files": total_dup,
+            "space_saveable_bytes": total_save,
+            "space_saveable": format_size(total_save),
+            "files_remaining": total_files - total_dup,
+        },
+        "groups": groups,
+    }
 
+    json_path = os.path.join(output_dir, "duplicates_data.json")
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    return report
+
+
+def write_text_report(
+    report_data: dict,
+    output_dir: str,
+):
+    """從 JSON 資料生成可讀文字報告"""
     report_path = os.path.join(output_dir, "duplicates_report.txt")
-    delete_list_path = os.path.join(output_dir, "duplicates_to_delete.txt")
+    summary = report_data["summary"]
 
-    with open(report_path, 'w', encoding='utf-8') as report:
-        report.write("=" * 70 + "\n")
-        report.write("Duplicate File Report / 重複檔案掃描報告\n")
-        report.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        report.write(f"Directory: {target_dir}\n")
-        report.write("=" * 70 + "\n\n")
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write("=" * 70 + "\n")
+        f.write("Duplicate File Report / 重複檔案掃描報告\n")
+        f.write(f"Time: {report_data['scan_time']}\n")
+        f.write(f"Directory: {report_data['target_dir']}\n")
+        f.write("=" * 70 + "\n\n")
 
-        group_num = 0
-        for h, files in sorted(dup_groups.items(), key=lambda x: -len(x[1])):
-            group_num += 1
-
-            files_with_size = [(f, size_map.get(f, 0)) for f in files]
-            files_with_size.sort(key=lambda x: -x[1])
-
-            keep_file, keep_size = files_with_size[0]
-            delete_files = files_with_size[1:]
-
-            group_saveable = sum(s for _, s in delete_files)
-            total_saveable += group_saveable
-            total_dup_files += len(delete_files)
-
-            report.write(f"--- Group #{group_num} ({len(files)} files) ---\n")
-            report.write(
-                f"  KEEP: {os.path.basename(keep_file)} "
-                f"({format_size(keep_size)})\n"
+        for i, group in enumerate(report_data["groups"], 1):
+            total_in_group = 1 + len(group["delete"])
+            f.write(f"--- Group #{i} ({total_in_group} files) ---\n")
+            f.write(
+                f"  KEEP: {group['keep']['path']} "
+                f"({format_size(group['keep']['size'])})\n"
             )
-            for df, ds in delete_files:
-                report.write(
-                    f"  DEL:  {os.path.basename(df)} "
-                    f"({format_size(ds)})\n"
+            for d in group["delete"]:
+                f.write(
+                    f"  DEL:  {d['path']} "
+                    f"({format_size(d['size'])})\n"
                 )
-                to_delete.append(df)
-            report.write(f"  Save: {format_size(group_saveable)}\n\n")
+            group_save = sum(d["size"] for d in group["delete"])
+            f.write(f"  Save: {format_size(group_save)}\n\n")
 
-        report.write("=" * 70 + "\n")
-        report.write("Summary\n")
-        report.write("=" * 70 + "\n")
-        report.write(f"Total files: {total_files}\n")
-        report.write(f"Duplicate groups: {group_num}\n")
-        report.write(f"Duplicate files (deletable): {total_dup_files}\n")
-        report.write(f"Space saveable: {format_size(total_saveable)}\n")
-        report.write(f"Files remaining: {total_files - total_dup_files}\n")
-
-    with open(delete_list_path, 'w', encoding='utf-8') as f:
-        for df in to_delete:
-            f.write(df + "\n")
-
-    return total_dup_files, total_saveable, to_delete
+        f.write("=" * 70 + "\n")
+        f.write("Summary\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"Total files: {summary['total_files']}\n")
+        f.write(f"Duplicate groups: {summary['duplicate_groups']}\n")
+        f.write(f"Duplicate files (deletable): {summary['deletable_files']}\n")
+        f.write(f"Space saveable: {summary['space_saveable']}\n")
+        f.write(f"Files remaining: {summary['files_remaining']}\n")
 
 
-def scan(target_dir: str, output_dir: str | None = None, use_pixel: bool = True):
+def scan(
+    target_dir: str,
+    output_dir: str | None = None,
+    use_pixel: bool = True,
+    recursive: bool = True,
+):
     """
     主掃描流程。
 
@@ -197,6 +288,7 @@ def scan(target_dir: str, output_dir: str | None = None, use_pixel: bool = True)
         target_dir: 要掃描的資料夾路徑
         output_dir: 報告輸出路徑 (預設 = target_dir)
         use_pixel: 是否使用像素比對 (預設 True)
+        recursive: 是否遞迴掃描子資料夾 (預設 True)
     """
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -205,19 +297,27 @@ def scan(target_dir: str, output_dir: str | None = None, use_pixel: bool = True)
 
     target_dir = os.path.abspath(target_dir)
     output_dir = os.path.abspath(output_dir)
-    os.makedirs(output_dir, exist_ok=True)
+
+    # 驗證參數
+    validate_scan_args(target_dir, output_dir)
+
+    settings = {
+        "use_pixel": use_pixel,
+        "recursive": recursive,
+    }
 
     print("=" * 50)
     print("Photo Dedup — Duplicate Scanner")
     print("=" * 50)
-    print(f"Target:  {target_dir}")
-    print(f"Output:  {output_dir}")
-    print(f"Mode:    {'Pixel comparison' if use_pixel else 'File MD5 only'}")
+    print(f"Target:    {target_dir}")
+    print(f"Output:    {output_dir}")
+    print(f"Mode:      {'Pixel comparison' if use_pixel else 'File MD5 only'}")
+    print(f"Recursive: {'Yes' if recursive else 'No'}")
     print()
 
     # Step 1
     print("[1/4] Collecting files...")
-    all_files = collect_files(target_dir)
+    all_files = collect_files(target_dir, recursive=recursive)
     print(f"  Found {len(all_files)} files")
 
     if not all_files:
@@ -233,34 +333,44 @@ def scan(target_dir: str, output_dir: str | None = None, use_pixel: bool = True)
     print(f"  Non-images (file MD5, size-matched): {len(non_image_candidates)}")
     print(f"  Total to process: {total_to_hash}")
 
-    # Step 3: HEIC support
+    # HEIC support
     if use_pixel:
         heic_ok = init_heic_support()
-        print(f"  HEIC support: {'OK' if heic_ok else 'NOT AVAILABLE (will use file MD5)'}")
+        print(
+            f"  HEIC support: "
+            f"{'OK' if heic_ok else 'NOT AVAILABLE (will use file MD5)'}"
+        )
 
-    # Step 4
-    print(f"[3/4] Computing hashes...")
+    # Step 3
+    print("[3/4] Computing hashes...")
     all_candidates = image_candidates + non_image_candidates
-    hash_groups, size_map = compute_hashes(all_candidates, use_pixel, total_to_hash)
-
-    # Step 5
-    print("[4/4] Generating report...")
-    dup_groups = {h: files for h, files in hash_groups.items() if len(files) > 1}
-    total_dup, total_save, _ = generate_report(
-        dup_groups, size_map, len(all_files), target_dir, output_dir
+    hash_groups, size_map = compute_hashes(
+        all_candidates, use_pixel, total_to_hash
     )
 
-    remaining = len(all_files) - total_dup
+    # Step 4
+    print("[4/4] Generating reports...")
+    dup_groups = {
+        h: files for h, files in hash_groups.items() if len(files) > 1
+    }
+
+    groups = build_groups(dup_groups, size_map, target_dir)
+    report_data = write_json_report(
+        groups, len(all_files), target_dir, output_dir, settings
+    )
+    write_text_report(report_data, output_dir)
+
+    summary = report_data["summary"]
     print()
     print("=" * 50)
     print("DONE!")
-    print(f"  Total files:         {len(all_files)}")
-    print(f"  Duplicate groups:    {len(dup_groups)}")
-    print(f"  Deletable:           {total_dup}")
-    print(f"  Space saveable:      {format_size(total_save)}")
-    print(f"  Remaining:           {remaining}")
+    print(f"  Total files:         {summary['total_files']}")
+    print(f"  Duplicate groups:    {summary['duplicate_groups']}")
+    print(f"  Deletable:           {summary['deletable_files']}")
+    print(f"  Space saveable:      {summary['space_saveable']}")
+    print(f"  Remaining:           {summary['files_remaining']}")
     print()
-    print(f"  Report:      {os.path.join(output_dir, 'duplicates_report.txt')}")
-    print(f"  Delete list: {os.path.join(output_dir, 'duplicates_to_delete.txt')}")
+    print(f"  JSON:   {os.path.join(output_dir, 'duplicates_data.json')}")
+    print(f"  Report: {os.path.join(output_dir, 'duplicates_report.txt')}")
     print()
     print("Review the report, then run: python clean.py --dir <DIR>")

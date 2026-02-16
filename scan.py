@@ -6,10 +6,10 @@ Usage:
     python scan.py --dir <PHOTO_DIR>
     python scan.py --dir <PHOTO_DIR> --output <OUTPUT_DIR>
     python scan.py --dir <PHOTO_DIR> --no-pixel
+    python scan.py --dir <PHOTO_DIR> --no-recursive
 """
 
 import argparse
-import sys
 
 from photo_dedup.scanner import scan
 
@@ -23,6 +23,7 @@ Examples:
   python scan.py --dir /path/to/photos
   python scan.py --dir /path/to/photos --output /path/to/reports
   python scan.py --dir /path/to/photos --no-pixel
+  python scan.py --dir /path/to/photos --no-recursive
         """,
     )
     parser.add_argument(
@@ -40,12 +41,18 @@ Examples:
         action="store_true",
         help="Disable pixel comparison, use file MD5 only (faster) / 停用像素比對",
     )
+    parser.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Don't scan subdirectories / 不掃描子資料夾",
+    )
 
     args = parser.parse_args()
     scan(
         target_dir=args.dir,
         output_dir=args.output,
         use_pixel=not args.no_pixel,
+        recursive=not args.no_recursive,
     )
 
 

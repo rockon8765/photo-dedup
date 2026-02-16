@@ -7,12 +7,13 @@ Usage:
     python clean.py --dir <PHOTO_DIR> --backup <BACKUP_DIR>
     python clean.py --dir <PHOTO_DIR> --no-rename
     python clean.py --dir <PHOTO_DIR> --dry-run
+    python clean.py --dir <PHOTO_DIR> --yes
+    python clean.py --dir <PHOTO_DIR> --undo
 """
 
 import argparse
-import sys
 
-from photo_dedup.cleaner import clean
+from photo_dedup.cleaner import clean, undo
 
 
 def main():
@@ -23,8 +24,9 @@ def main():
 Examples:
   python clean.py --dir /path/to/photos
   python clean.py --dir /path/to/photos --backup /path/to/backup
-  python clean.py --dir /path/to/photos --no-rename
   python clean.py --dir /path/to/photos --dry-run
+  python clean.py --dir /path/to/photos --yes
+  python clean.py --dir /path/to/photos --undo
         """,
     )
     parser.add_argument(
@@ -35,7 +37,7 @@ Examples:
     parser.add_argument(
         "--report", "-r",
         default=None,
-        help="Path to duplicates_report.txt (default: <dir>/duplicates_report.txt)",
+        help="Path to duplicates_data.json (default: <dir>/duplicates_data.json)",
     )
     parser.add_argument(
         "--backup", "-b",
@@ -52,15 +54,33 @@ Examples:
         action="store_true",
         help="Preview only, don't actually move or rename files / 預覽模式",
     )
+    parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip interactive confirmation / 跳過確認提示（適合自動化）",
+    )
+    parser.add_argument(
+        "--undo",
+        action="store_true",
+        help="Undo previous cleanup using transaction log / 回滾上次清理",
+    )
 
     args = parser.parse_args()
-    clean(
-        target_dir=args.dir,
-        report_path=args.report,
-        backup_dir=args.backup,
-        do_rename=not args.no_rename,
-        dry_run=args.dry_run,
-    )
+
+    if args.undo:
+        undo(
+            target_dir=args.dir,
+            backup_dir=args.backup,
+        )
+    else:
+        clean(
+            target_dir=args.dir,
+            json_path=args.report,
+            backup_dir=args.backup,
+            do_rename=not args.no_rename,
+            dry_run=args.dry_run,
+            auto_yes=args.yes,
+        )
 
 
 if __name__ == "__main__":

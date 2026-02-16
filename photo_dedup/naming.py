@@ -9,6 +9,17 @@ import re
 from pathlib import Path
 
 
+# 常見圖片副檔名優先順序 (越前面越優先)
+EXTENSION_PRIORITY = {
+    '.jpg': 10,
+    '.jpeg': 9,
+    '.png': 8,
+    '.heic': 7,
+    '.webp': 6,
+    '.dng': 5,
+}
+
+
 def readability_score(filename: str) -> float:
     """
     評估檔名的可讀性。分數越高 = 越可讀。
@@ -66,9 +77,22 @@ def readability_score(filename: str) -> float:
     return score
 
 
-def find_best_name(keep_name: str, delete_names: list[str]) -> tuple[str, bool]:
+def extension_score(ext: str) -> int:
+    """評估副檔名的優先順序。分數越高表示越通用/優先。"""
+    return EXTENSION_PRIORITY.get(ext.lower(), 0)
+
+
+def find_best_name(
+    keep_name: str,
+    delete_names: list[str],
+) -> tuple[str, bool]:
     """
-    在同組所有檔案中，找出可讀性最高的檔名。
+    在同組所有檔案中，找出最佳的檔名與副檔名組合。
+
+    策略：
+      1. 從所有檔名中選出可讀性最高的 stem
+      2. 從所有副檔名中選出最優先的 extension
+      3. 組合為新檔名
 
     Args:
         keep_name: 目前保留的檔名 (basename)
@@ -76,20 +100,31 @@ def find_best_name(keep_name: str, delete_names: list[str]) -> tuple[str, bool]:
 
     Returns:
         (new_name, should_rename):
-            new_name: 建議的新檔名 (保留原副檔名)
+            new_name: 建議的新檔名
             should_rename: 是否需要改名
     """
     all_names = [keep_name] + delete_names
+
+    # 1. 選最可讀的 stem
     best_name = max(all_names, key=readability_score)
-
-    if best_name == keep_name:
-        return keep_name, False
-
-    # 使用最佳名稱，但保留原檔的副檔名
-    keep_ext = Path(keep_name).suffix
     best_stem = Path(best_name).stem
     # 移除副本標記
     best_stem = re.sub(r'\s*\(\d+\)', '', best_stem).strip()
-    new_name = best_stem + keep_ext
 
-    return new_name, True
+    # 2. 選最優先的副檔名
+    all_exts = [Path(n).suffix for n in all_names]
+    # 優先使用 keep 檔的副檔名，除非有更優先的
+    keep_ext = Path(keep_name).suffix
+    best_ext = keep_ext  # default
+
+    # 找出最高優先的副檔名
+    ext_scores = [(ext, extension_score(ext)) for ext in set(all_exts)]
+    ext_scores.sort(key=lambda x: -x[1])
+    if ext_scores and ext_scores[0][1] > extension_score(keep_ext):
+        best_ext = ext_scores[0][0]
+
+    # 3. 組合
+    new_name = best_stem + best_ext
+
+    should_rename = (new_name != keep_name)
+    return new_name, should_rename
