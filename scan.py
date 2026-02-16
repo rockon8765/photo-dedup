@@ -10,7 +10,9 @@ Usage:
 """
 
 import argparse
+import sys
 
+from photo_dedup.exceptions import PhotoDedupError
 from photo_dedup.scanner import scan
 
 
@@ -48,12 +50,17 @@ Examples:
     )
 
     args = parser.parse_args()
-    scan(
-        target_dir=args.dir,
-        output_dir=args.output,
-        use_pixel=not args.no_pixel,
-        recursive=not args.no_recursive,
-    )
+
+    try:
+        scan(
+            target_dir=args.dir,
+            output_dir=args.output,
+            use_pixel=not args.no_pixel,
+            recursive=not args.no_recursive,
+        )
+    except PhotoDedupError as e:
+        print(f"\n❌ {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

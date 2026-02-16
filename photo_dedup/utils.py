@@ -1,5 +1,10 @@
 """共用工具函式"""
 
+from . import __version__
+
+
+VERSION = __version__
+
 
 def format_size(size_bytes: int) -> str:
     """將 bytes 轉成可讀格式 (B / KB / MB / GB)"""

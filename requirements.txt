@@ -1,2 +1,5 @@
 Pillow>=10.0.0
-pillow-heif>=0.14.0
+
+# Optional: HEIC/HEIF support (Apple photos)
+# Install with: pip install pillow-heif
+# pillow-heif>=0.14.0

@@ -5,15 +5,16 @@ clean.py — 安全刪除重複檔案，並將保留檔改名為最可讀的名�
 Usage:
     python clean.py --dir <PHOTO_DIR>
     python clean.py --dir <PHOTO_DIR> --backup <BACKUP_DIR>
-    python clean.py --dir <PHOTO_DIR> --no-rename
     python clean.py --dir <PHOTO_DIR> --dry-run
     python clean.py --dir <PHOTO_DIR> --yes
     python clean.py --dir <PHOTO_DIR> --undo
 """
 
 import argparse
+import sys
 
 from photo_dedup.cleaner import clean, undo
+from photo_dedup.exceptions import PhotoDedupError
 
 
 def main():
@@ -27,6 +28,7 @@ Examples:
   python clean.py --dir /path/to/photos --dry-run
   python clean.py --dir /path/to/photos --yes
   python clean.py --dir /path/to/photos --undo
+  python clean.py --dir /path/to/photos --force   # ignore dir mismatch
         """,
     )
     parser.add_argument(
@@ -64,23 +66,33 @@ Examples:
         action="store_true",
         help="Undo previous cleanup using transaction log / 回滾上次清理",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow directory mismatch between report and --dir / 忽略目錄不一致",
+    )
 
     args = parser.parse_args()
 
-    if args.undo:
-        undo(
-            target_dir=args.dir,
-            backup_dir=args.backup,
-        )
-    else:
-        clean(
-            target_dir=args.dir,
-            json_path=args.report,
-            backup_dir=args.backup,
-            do_rename=not args.no_rename,
-            dry_run=args.dry_run,
-            auto_yes=args.yes,
-        )
+    try:
+        if args.undo:
+            undo(
+                target_dir=args.dir,
+                backup_dir=args.backup,
+            )
+        else:
+            clean(
+                target_dir=args.dir,
+                json_path=args.report,
+                backup_dir=args.backup,
+                do_rename=not args.no_rename,
+                dry_run=args.dry_run,
+                auto_yes=args.yes,
+                force_mismatch=args.force,
+            )
+    except PhotoDedupError as e:
+        print(f"\n❌ {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

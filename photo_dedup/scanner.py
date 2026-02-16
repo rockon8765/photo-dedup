@@ -15,35 +15,44 @@ import sys
 import time
 from collections import defaultdict
 
+from .exceptions import DirectoryNotFoundError, PermissionError_
 from .hasher import IMAGE_EXTENSIONS, compute_hash, init_heic_support
-from .utils import format_size
+from .utils import VERSION, format_size
 
 
 def validate_scan_args(target_dir: str, output_dir: str):
-    """驗證掃描參數，失敗時直接 sys.exit"""
+    """
+    驗證掃描參數。
+
+    Raises:
+        DirectoryNotFoundError: 目標資料夾不存在
+        PermissionError_: 權限不足
+    """
     if not os.path.exists(target_dir):
-        print(f"❌ Directory not found: {target_dir}")
-        sys.exit(1)
+        raise DirectoryNotFoundError(f"Directory not found: {target_dir}")
 
     if not os.path.isdir(target_dir):
-        print(f"❌ Not a directory: {target_dir}")
-        sys.exit(1)
+        raise DirectoryNotFoundError(f"Not a directory: {target_dir}")
 
     if not os.access(target_dir, os.R_OK):
-        print(f"❌ No read permission: {target_dir}")
-        sys.exit(1)
+        raise PermissionError_(f"No read permission: {target_dir}")
 
     # 確保 output_dir 可寫
-    os.makedirs(output_dir, exist_ok=True)
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as e:
+        raise PermissionError_(
+            f"Cannot create output directory: {output_dir} ({e})"
+        )
+
     if not os.access(output_dir, os.W_OK):
-        print(f"❌ No write permission: {output_dir}")
-        sys.exit(1)
+        raise PermissionError_(f"No write permission: {output_dir}")
 
 
 def collect_files(
     target_dir: str,
     recursive: bool = True,
-) -> list[tuple[str, int, str]]:
+) -> tuple[list[tuple[str, int, str]], list[str]]:
     """
     收集目標資料夾中的所有檔案。
 
@@ -52,10 +61,13 @@ def collect_files(
         recursive: 是否遞迴掃描子資料夾
 
     Returns:
-        list of (absolute_path, size, ext)
+        (files, errors):
+            files: list of (absolute_path, size, ext)
+            errors: list of error messages for skipped files
     """
     skip_dirs = {'_duplicates_backup', '.git', '__pycache__'}
     all_files = []
+    errors = []
 
     if recursive:
         for dirpath, dirnames, filenames in os.walk(target_dir):
@@ -72,8 +84,8 @@ def collect_files(
                     size = os.path.getsize(filepath)
                     ext = os.path.splitext(name)[1].lower()
                     all_files.append((filepath, size, ext))
-                except OSError:
-                    pass
+                except OSError as e:
+                    errors.append(f"{filepath}: {e}")
     else:
         for entry in os.scandir(target_dir):
             if entry.is_file(follow_symlinks=False) and not entry.name.startswith('.'):
@@ -81,10 +93,10 @@ def collect_files(
                     stat = entry.stat()
                     ext = os.path.splitext(entry.name)[1].lower()
                     all_files.append((entry.path, stat.st_size, ext))
-                except OSError:
-                    pass
+                except OSError as e:
+                    errors.append(f"{entry.path}: {e}")
 
-    return all_files
+    return all_files, errors
 
 
 def categorize_files(
@@ -213,7 +225,7 @@ def write_json_report(
     )
 
     report = {
-        "version": "1.1.0",
+        "version": VERSION,
         "scan_time": time.strftime('%Y-%m-%d %H:%M:%S'),
         "target_dir": target_dir,
         "settings": settings,
@@ -289,6 +301,10 @@ def scan(
         output_dir: 報告輸出路徑 (預設 = target_dir)
         use_pixel: 是否使用像素比對 (預設 True)
         recursive: 是否遞迴掃描子資料夾 (預設 True)
+
+    Raises:
+        DirectoryNotFoundError: 目標資料夾不存在
+        PermissionError_: 權限不足
     """
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -298,7 +314,7 @@ def scan(
     target_dir = os.path.abspath(target_dir)
     output_dir = os.path.abspath(output_dir)
 
-    # 驗證參數
+    # 驗證參數（會拋出自訂例外）
     validate_scan_args(target_dir, output_dir)
 
     settings = {
@@ -317,8 +333,15 @@ def scan(
 
     # Step 1
     print("[1/4] Collecting files...")
-    all_files = collect_files(target_dir, recursive=recursive)
+    all_files, collect_errors = collect_files(target_dir, recursive=recursive)
     print(f"  Found {len(all_files)} files")
+
+    if collect_errors:
+        print(f"  ⚠ Skipped {len(collect_errors)} files due to errors:")
+        for err in collect_errors[:5]:
+            print(f"    {err}")
+        if len(collect_errors) > 5:
+            print(f"    ... and {len(collect_errors) - 5} more")
 
     if not all_files:
         print("  No files to scan. Exiting.")

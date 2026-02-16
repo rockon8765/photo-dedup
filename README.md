@@ -6,15 +6,16 @@ Find and remove duplicate photos in your Google Photos backup (or any photo dire
 
 ## Features
 
-- **Pixel-level comparison** — Compares decoded pixel data for images, ignoring EXIF/metadata differences. Two files with identical pixels but different metadata are correctly identified as duplicates.
-- **Recursive scanning** — Scans all subdirectories by default.
-- **Smart file retention** — Keeps the largest file in each duplicate group (preserves the most complete metadata).
-- **Readable rename** — Renames kept files to the most human-readable name and optimal extension (e.g. `1609753382985.png` → `20210103_081230.jpg`).
-- **Safe deletion** — Moves duplicates to a backup folder (preserving directory structure) instead of deleting.
-- **Undo support** — Transaction log enables full rollback with `--undo`.
-- **JSON output** — Structured `duplicates_data.json` for machine processing; human-readable `.txt` report also generated.
-- **HEIC support** — Full support for Apple HEIC photos via `pillow-heif`.
-- **Memory safety** — Limits max image pixels (100MP) to prevent decompression bombs.
+- **Pixel-level comparison** — Compares decoded pixel data for images, ignoring EXIF/metadata differences
+- **Recursive scanning** — Scans all subdirectories by default
+- **Smart file retention** — Keeps the largest file in each duplicate group (preserves the most complete metadata)
+- **Readable rename** — Renames kept files to the most human-readable name (preserves original extension)
+- **Safe deletion** — Moves duplicates to a backup folder (preserving directory structure)
+- **Undo support** — Transaction log (with fsync) enables full rollback with `--undo`
+- **Path safety** — Validates all paths to prevent directory traversal attacks
+- **JSON output** — Structured `duplicates_data.json` for machine processing
+- **HEIC support** — Optional support for Apple HEIC photos via `pillow-heif`
+- **Memory safety** — Limits max image pixels (60MP, ~180MB) to prevent decompression bombs
 
 ---
 
@@ -23,6 +24,9 @@ Find and remove duplicate photos in your Google Photos backup (or any photo dire
 ```bash
 # 1. Install dependencies
 pip install -r requirements.txt
+
+# Optional: HEIC support
+pip install pillow-heif
 
 # 2. Scan for duplicates (recursive by default)
 python scan.py --dir /path/to/photos
@@ -56,10 +60,6 @@ python scan.py --dir <DIR> [options]
 | `--no-pixel` | Use file-level MD5 instead of pixel comparison (faster but less accurate) |
 | `--no-recursive` | Only scan the top-level directory, skip subdirectories |
 
-**Output files:**
-- `duplicates_data.json` — Structured report (used by `clean.py`)
-- `duplicates_report.txt` — Human-readable report
-
 ### `clean.py` — Safe Deletion + Rename
 
 ```
@@ -69,12 +69,13 @@ python clean.py --dir <DIR> [options]
 | Option | Description |
 |---|---|
 | `--dir`, `-d` | **(Required)** Photo directory |
-| `--report`, `-r` | Path to `duplicates_data.json` (default: `<dir>/duplicates_data.json`) |
+| `--report`, `-r` | Path to `duplicates_data.json` |
 | `--backup`, `-b` | Backup directory (default: `<dir>/_duplicates_backup`) |
 | `--no-rename` | Skip renaming kept files |
-| `--dry-run` | Preview mode — show what would happen without making changes |
-| `--yes`, `-y` | Skip interactive confirmation (for automation / cron jobs) |
+| `--dry-run` | Preview mode, no file system changes |
+| `--yes`, `-y` | Skip interactive confirmation (for automation) |
 | `--undo` | Undo previous cleanup using the transaction log |
+| `--force` | Allow directory mismatch between report and `--dir` |
 
 ## How It Works
 
@@ -84,20 +85,26 @@ python clean.py --dir <DIR> [options]
 Image files (.jpg .jpeg .png .heic .webp .dng)
   → Decode with Pillow → Convert to RGB → MD5 of pixel bytes
   → Ignores EXIF, ICC profiles, thumbnails, compression differences
-  → Images > 100MP auto-fallback to file MD5 (memory safety)
+  → Images > 60MP auto-fallback to file MD5 (memory safety)
 
 Other files (.mp4 .mov .gif .3gp etc.)
   → Pre-filter by file size (different size = not duplicate)
   → MD5 of entire file contents
 ```
 
-### Retention Rule
+### Safety Features
 
-For each duplicate group: **keep the largest file** (most likely has complete metadata).
+| Feature | Details |
+|---|---|
+| **Path validation** | Rejects absolute paths, `..` traversal, and paths escaping target dir |
+| **Dir mismatch check** | Verifies report's target\_dir matches `--dir` (override with `--force`) |
+| **Backup structure** | Preserves original directory structure in backup folder |
+| **Transaction log** | Every move/rename recorded with fsync; supports `--undo` |
+| **Dry run** | `--dry-run` makes zero file system changes (no dirs created) |
+| **Input validation** | Checks directory existence and permissions upfront |
+| **Memory limit** | MAX\_IMAGE\_PIXELS = 60MP (~180MB max per image) |
 
-### Filename Readability + Extension Priority
-
-After keeping the best file, rename it using the most readable name AND the most optimal extension:
+### Filename Readability
 
 | Score | Filename Type | Example |
 |---|---|---|
@@ -106,23 +113,21 @@ After keeping the best file, rename it using the most readable name AND the most
 | -10 | Unix timestamp | `1609753382985.jpeg` |
 | -20 | Copy suffix | `photo (2).jpg` |
 
-Extension priority: `.jpg` > `.jpeg` > `.png` > `.heic` > `.webp` > `.dng`
+> Note: Renaming only changes the stem (basename), never the extension. This prevents creating files where the extension doesn't match the actual content.
 
-### Safety Features
+## Testing
 
-| Feature | Details |
-|---|---|
-| **Backup** | Duplicates moved to backup folder, preserving original directory structure |
-| **Transaction log** | All operations recorded in `_cleanup_log.json` |
-| **Undo** | `--undo` reverses all moves and renames |
-| **Dry run** | `--dry-run` previews without changes |
-| **Validation** | Checks directory existence, permissions before starting |
+```bash
+python tests/test_core.py -v
+```
+
+17 tests covering path safety, naming strategy, and end-to-end flow.
 
 ## Requirements
 
 - Python 3.10+
 - [Pillow](https://python-pillow.org/) — Image processing
-- [pillow-heif](https://github.com/bigcat88/pillow_heif) — HEIC/HEIF support (optional but recommended)
+- [pillow-heif](https://github.com/bigcat88/pillow_heif) — HEIC/HEIF support *(optional)*
 
 ## License
 

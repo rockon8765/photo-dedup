@@ -3,15 +3,19 @@
 
 流程：
   1. 讀取 JSON 結構化報告 (duplicates_data.json)
-  2. 為每組選出最可讀的檔名
-  3. 將重複檔案移到備份資料夾 (保留原始目錄結構)
-  4. 將保留的檔案改名為最可讀的名稱
-  5. 記錄 transaction log 供回滾使用
+  2. 驗證路徑安全性（防止路徑逸出）
+  3. 比對報告的 target_dir 與當前 --dir
+  4. 為每組選出最可讀的檔名
+  5. 將重複檔案移到備份資料夾 (保留原始目錄結構)
+  6. 將保留的檔案改名為最可讀的名稱
+  7. 每次操作後即寫入 transaction log 供回滾使用
 
 安全措施：
-  - 備份保留來源目錄結構，方便追溯
-  - Transaction log 支援 --undo 回滾
-  - --dry-run 預覽模式
+  - 路徑逸出防護（不接受 .. 或絕對路徑）
+  - target_dir 一致性校驗
+  - 備份保留來源目錄結構
+  - 逐筆寫入 transaction log
+  - --dry-run 不建立任何目錄
   - --yes 非互動模式
 """
 
@@ -22,49 +26,176 @@ import sys
 import time
 from pathlib import Path
 
+from .exceptions import (
+    DirectoryMismatchError,
+    DirectoryNotFoundError,
+    InvalidReportError,
+    PathTraversalError,
+    PermissionError_,
+)
 from .naming import find_best_name
-from .utils import format_size
+from .utils import VERSION, format_size
+
+
+# ── 安全性 ────────────────────────────────────────
+
+
+def _validate_relative_path(rel_path: str, target_dir: str) -> str:
+    """
+    驗證相對路徑的安全性。
+
+    檢查：
+      1. 不可為絕對路徑
+      2. 不可包含 ..
+      3. resolve() 後必須仍在 target_dir 之下
+
+    Returns:
+        resolve 後的絕對路徑
+
+    Raises:
+        PathTraversalError: 路徑逸出目標資料夾
+    """
+    # 拒絕絕對路徑
+    if os.path.isabs(rel_path):
+        raise PathTraversalError(
+            f"Absolute path in report (security violation): {rel_path}"
+        )
+
+    # 拒絕 ..
+    if '..' in rel_path.replace('\\', '/').split('/'):
+        raise PathTraversalError(
+            f"Path traversal detected (..): {rel_path}"
+        )
+
+    # resolve 後必須在 target_dir 之下
+    abs_path = os.path.normpath(os.path.join(target_dir, rel_path))
+    target_norm = os.path.normpath(target_dir)
+
+    if not abs_path.startswith(target_norm + os.sep) and abs_path != target_norm:
+        raise PathTraversalError(
+            f"Path escapes target directory: {rel_path} → {abs_path}"
+        )
+
+    return abs_path
+
+
+def _validate_all_paths(groups: list[dict], target_dir: str):
+    """驗證報告中所有路徑的安全性"""
+    for i, g in enumerate(groups):
+        try:
+            _validate_relative_path(g["keep"]["path"], target_dir)
+            for d in g["delete"]:
+                _validate_relative_path(d["path"], target_dir)
+        except PathTraversalError as e:
+            raise PathTraversalError(
+                f"Group #{i + 1}: {e}"
+            )
 
 
 def validate_clean_args(
     target_dir: str,
     json_path: str,
-    backup_dir: str,
 ):
-    """驗證清理參數，失敗時直接 sys.exit"""
+    """
+    驗證清理參數。
+
+    Raises:
+        DirectoryNotFoundError: 目標資料夾不存在
+        PermissionError_: 權限不足
+        InvalidReportError: 報告檔不存在
+    """
     if not os.path.isdir(target_dir):
-        print(f"❌ Directory not found: {target_dir}")
-        sys.exit(1)
+        raise DirectoryNotFoundError(
+            f"Directory not found: {target_dir}"
+        )
 
     if not os.access(target_dir, os.W_OK):
-        print(f"❌ No write permission: {target_dir}")
-        sys.exit(1)
+        raise PermissionError_(
+            f"No write permission: {target_dir}"
+        )
 
     if not os.path.isfile(json_path):
-        print(f"❌ JSON report not found: {json_path}")
-        print("   Run scan.py first to generate the report.")
-        sys.exit(1)
+        raise InvalidReportError(
+            f"JSON report not found: {json_path}\n"
+            f"Run scan.py first to generate the report."
+        )
 
-    # 確保備份目錄可建立
-    try:
-        os.makedirs(backup_dir, exist_ok=True)
-    except OSError as e:
-        print(f"❌ Cannot create backup directory: {backup_dir} ({e})")
-        sys.exit(1)
 
-    if not os.access(backup_dir, os.W_OK):
-        print(f"❌ No write permission for backup: {backup_dir}")
-        sys.exit(1)
+def validate_dir_match(
+    report_data: dict,
+    target_dir: str,
+    force: bool = False,
+):
+    """
+    比對報告的 target_dir 與 clean 的 --dir。
+
+    Raises:
+        DirectoryMismatchError: 目錄不一致且未使用 --force
+    """
+    report_dir = os.path.normpath(report_data.get("target_dir", ""))
+    current_dir = os.path.normpath(target_dir)
+
+    if report_dir != current_dir:
+        if force:
+            print(
+                f"  ⚠ Directory mismatch (--force used):\n"
+                f"    Report:  {report_dir}\n"
+                f"    Current: {current_dir}"
+            )
+        else:
+            raise DirectoryMismatchError(
+                f"Report was generated for:\n"
+                f"    {report_dir}\n"
+                f"  but --dir is:\n"
+                f"    {current_dir}\n"
+                f"  Use --force to override this check."
+            )
+
+
+# ── Transaction Log ───────────────────────────────
+
+
+def _init_log(target_dir: str, backup_dir: str) -> dict:
+    """建立初始 transaction log"""
+    return {
+        "version": VERSION,
+        "time": time.strftime('%Y-%m-%d %H:%M:%S'),
+        "target_dir": target_dir,
+        "backup_dir": backup_dir,
+        "moves": [],
+        "renames": [],
+        "status": "in_progress",
+    }
+
+
+def _append_and_save_log(log: dict, log_path: str):
+    """寫入 transaction log 並 fsync"""
+    with open(log_path, 'w', encoding='utf-8') as f:
+        json.dump(log, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+# ── 主流程 ────────────────────────────────────────
 
 
 def load_json_report(json_path: str) -> dict:
-    """載入 JSON 結構化報告"""
-    with open(json_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    """
+    載入 JSON 結構化報告。
+
+    Raises:
+        InvalidReportError: JSON 格式錯誤
+    """
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise InvalidReportError(f"Invalid JSON: {json_path} ({e})")
 
     if "groups" not in data:
-        print(f"❌ Invalid JSON report: missing 'groups' key")
-        sys.exit(1)
+        raise InvalidReportError(
+            f"Invalid report format: missing 'groups' key"
+        )
 
     return data
 
@@ -76,6 +207,7 @@ def clean(
     do_rename: bool = True,
     dry_run: bool = False,
     auto_yes: bool = False,
+    force_mismatch: bool = False,
 ):
     """
     主清理流程。
@@ -87,6 +219,11 @@ def clean(
         do_rename: 是否改名保留檔案 (預設 True)
         dry_run: 預覽模式，不實際操作 (預設 False)
         auto_yes: 跳過互動確認 (預設 False)
+        force_mismatch: 允許 target_dir 不一致 (預設 False)
+
+    Raises:
+        DirectoryNotFoundError, PermissionError_, InvalidReportError,
+        PathTraversalError, DirectoryMismatchError
     """
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -102,14 +239,22 @@ def clean(
     else:
         backup_dir = os.path.abspath(backup_dir)
 
-    # 驗證參數
-    validate_clean_args(target_dir, json_path, backup_dir)
+    # 驗證參數（不建立任何目錄）
+    validate_clean_args(target_dir, json_path)
 
     # 載入 JSON 報告
     print("Loading JSON report...")
     report_data = load_json_report(json_path)
     groups = report_data["groups"]
     print(f"  {len(groups)} duplicate groups")
+
+    # 比對 target_dir
+    validate_dir_match(report_data, target_dir, force=force_mismatch)
+
+    # 路徑安全性驗證
+    print("  Validating paths...")
+    _validate_all_paths(groups, target_dir)
+    print("  ✓ All paths safe")
 
     # 計算改名清單
     rename_list = []  # [(old_rel, new_rel, old_name, new_name)]
@@ -123,7 +268,9 @@ def clean(
             if should_rename:
                 keep_rel = g["keep"]["path"]
                 keep_dir = os.path.dirname(keep_rel)
-                new_rel = os.path.join(keep_dir, new_name) if keep_dir else new_name
+                new_rel = (
+                    os.path.join(keep_dir, new_name) if keep_dir else new_name
+                )
                 rename_list.append((keep_rel, new_rel, keep_name, new_name))
         print(f"  Files to rename: {len(rename_list)}")
 
@@ -164,21 +311,14 @@ def clean(
             print("Cancelled.")
             return
 
-    # Transaction log — 記錄所有操作以支援回滾
-    transaction_log = {
-        "version": "1.1.0",
-        "time": time.strftime('%Y-%m-%d %H:%M:%S'),
-        "target_dir": target_dir,
-        "backup_dir": backup_dir,
-        "moves": [],   # [{"from": abs, "to": abs}]
-        "renames": [],  # [{"from": abs, "to": abs}]
-        "status": "in_progress",
-    }
+    # 正式執行：建立備份目錄和 transaction log
+    os.makedirs(backup_dir, exist_ok=True)
+    log = _init_log(target_dir, backup_dir)
     log_path = os.path.join(backup_dir, "_cleanup_log.json")
+    _append_and_save_log(log, log_path)  # 開始前先落盤
 
     # --- Phase A: 移動重複檔案 ---
     print(f"\n[1/2] Moving duplicates to backup...")
-    os.makedirs(backup_dir, exist_ok=True)
 
     moved = 0
     skipped = 0
@@ -213,27 +353,32 @@ def clean(
             shutil.move(src, dest)
             moved += 1
             total_size += file_size
-            transaction_log["moves"].append({"from": src, "to": dest})
+
+            # 逐筆記錄 + 寫入 log
+            log["moves"].append({"from": src, "to": dest})
+            _append_and_save_log(log, log_path)
 
             if moved % 500 == 0:
                 print(f"  Moved {moved} files...")
-                # 中途儲存 log
-                _save_log(log_path, transaction_log)
 
         except Exception as e:
             move_errors.append((rel_path, str(e)))
 
-    print(f"  Done: moved {moved}, skipped {skipped}, errors {len(move_errors)}")
+    print(
+        f"  Done: moved {moved}, "
+        f"skipped {skipped}, "
+        f"errors {len(move_errors)}"
+    )
     print(f"  Space freed: {format_size(total_size)}")
 
-    # 儲存 Phase A log
-    transaction_log["status"] = "moves_complete"
-    _save_log(log_path, transaction_log)
+    # 更新 Phase A 狀態
+    log["status"] = "moves_complete"
+    _append_and_save_log(log, log_path)
 
     # --- Phase B: 改名保留檔案 ---
+    renamed = 0
     if rename_list:
         print(f"\n[2/2] Renaming kept files...")
-        renamed = 0
         rename_skipped = 0
         rename_errors = []
 
@@ -252,10 +397,11 @@ def clean(
             try:
                 os.rename(old_abs, new_abs)
                 renamed += 1
-                transaction_log["renames"].append({
-                    "from": old_abs,
-                    "to": new_abs,
-                })
+
+                # 逐筆記錄 + 寫入 log
+                log["renames"].append({"from": old_abs, "to": new_abs})
+                _append_and_save_log(log, log_path)
+
             except Exception as e:
                 rename_errors.append((old_name, new_name, str(e)))
 
@@ -271,8 +417,8 @@ def clean(
                 print(f"    {old} → {new}: {err}")
 
     # --- 完成 ---
-    transaction_log["status"] = "complete"
-    _save_log(log_path, transaction_log)
+    log["status"] = "complete"
+    _append_and_save_log(log, log_path)
 
     print()
     print("=" * 50)
@@ -297,6 +443,9 @@ def undo(target_dir: str, backup_dir: str | None = None):
     回滾清理操作：
       1. 還原改名 (逆序)
       2. 還原移動 (逆序)
+
+    Raises:
+        InvalidReportError: 找不到 transaction log
     """
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -310,9 +459,10 @@ def undo(target_dir: str, backup_dir: str | None = None):
     log_path = os.path.join(backup_dir, "_cleanup_log.json")
 
     if not os.path.isfile(log_path):
-        print(f"❌ Transaction log not found: {log_path}")
-        print("   Cannot undo without a log file.")
-        sys.exit(1)
+        raise InvalidReportError(
+            f"Transaction log not found: {log_path}\n"
+            f"Cannot undo without a log file."
+        )
 
     with open(log_path, 'r', encoding='utf-8') as f:
         log = json.load(f)
@@ -337,8 +487,8 @@ def undo(target_dir: str, backup_dir: str | None = None):
         print("\n[1/2] Reverting renames...")
         reverted = 0
         for entry in reversed(renames):
-            src = entry["to"]   # 現在的位置
-            dst = entry["from"]  # 原始位置
+            src = entry["to"]
+            dst = entry["from"]
             if os.path.exists(src) and not os.path.exists(dst):
                 try:
                     os.rename(src, dst)
@@ -352,8 +502,8 @@ def undo(target_dir: str, backup_dir: str | None = None):
         print("\n[2/2] Restoring moved files...")
         restored = 0
         for entry in reversed(moves):
-            src = entry["to"]   # 備份位置
-            dst = entry["from"]  # 原始位置
+            src = entry["to"]
+            dst = entry["from"]
             if os.path.exists(src):
                 try:
                     dst_dir = os.path.dirname(dst)
@@ -371,13 +521,7 @@ def undo(target_dir: str, backup_dir: str | None = None):
     # 更新 log
     log["status"] = "undone"
     log["undo_time"] = time.strftime('%Y-%m-%d %H:%M:%S')
-    _save_log(log_path, log)
+    _append_and_save_log(log, log_path)
 
     print()
     print("Undo complete!")
-
-
-def _save_log(log_path: str, log: dict):
-    """儲存 transaction log"""
-    with open(log_path, 'w', encoding='utf-8') as f:
-        json.dump(log, f, ensure_ascii=False, indent=2)
