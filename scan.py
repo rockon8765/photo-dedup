@@ -10,13 +10,32 @@ Usage:
 """
 
 import argparse
+import logging
 import sys
 
 from photo_dedup.exceptions import PhotoDedupError
 from photo_dedup.scanner import scan
 
 
+def _configure_logging():
+    """Set up root logging: INFO to stdout."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        stream=sys.stdout,
+    )
+
+
+def _configure_stdout():
+    """Enable line buffering when stdout supports it."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
+
 def main():
+    _configure_stdout()
+    _configure_logging()
+
     parser = argparse.ArgumentParser(
         description="Scan a directory for duplicate files / 掃描資料夾中的重複檔案",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -59,7 +78,7 @@ Examples:
             recursive=not args.no_recursive,
         )
     except PhotoDedupError as e:
-        print(f"\n❌ {e}", file=sys.stderr)
+        print(f"\nERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
 

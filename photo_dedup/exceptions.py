@@ -11,7 +11,7 @@ class DirectoryNotFoundError(PhotoDedupError):
     pass
 
 
-class PermissionError_(PhotoDedupError):
+class AccessDeniedError(PhotoDedupError):
     """權限不足"""
     pass
 

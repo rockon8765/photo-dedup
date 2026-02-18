@@ -12,15 +12,30 @@
 """
 
 import hashlib
+import logging
 import os
+from typing import NamedTuple
+
+logger = logging.getLogger(__name__)
 
 # 支援像素比對的圖片副檔名
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.webp', '.dng'}
+IMAGE_EXTENSIONS = frozenset({'.jpg', '.jpeg', '.png', '.heic', '.webp', '.dng'})
 
 # 像素上限 (60 megapixels → 最大 ~180MB RAM per image)
 # Pillow 的 tobytes() 會一次載入整張圖的 RGB 資料，
 # 無法真正串流讀取，因此用此上限控制記憶體用量。
 MAX_IMAGE_PIXELS = 60_000_000
+
+
+class HashResult(NamedTuple):
+    """hash 結果，區分 hash 方法"""
+    method: str  # "pixel" or "file"
+    digest: str  # hex digest
+
+    def __str__(self) -> str:
+        if self.method == "file":
+            return f"FILE:{self.digest}"
+        return self.digest
 
 
 def get_file_md5(filepath: str, chunk_size: int = 65536) -> str:
@@ -35,7 +50,7 @@ def get_file_md5(filepath: str, chunk_size: int = 65536) -> str:
     return h.hexdigest()
 
 
-def get_pixel_hash(filepath: str) -> str:
+def get_pixel_hash(filepath: str) -> HashResult:
     """
     用 Pillow 解碼圖片，取出純像素資料的 MD5。
     忽略 EXIF、ICC profile 等 metadata 差異。
@@ -44,43 +59,50 @@ def get_pixel_hash(filepath: str) -> str:
       Pillow 不支援逐列串流讀取像素，img.tobytes() 會產生
       width × height × 3 bytes 的完整 buffer。
       MAX_IMAGE_PIXELS 限制確保單張圖最多使用 ~180MB。
+
+    不修改全域 Image.MAX_IMAGE_PIXELS，改為函式內自行檢查尺寸。
     """
     from PIL import Image
-
-    original_max = Image.MAX_IMAGE_PIXELS
-    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
     try:
         with Image.open(filepath) as img:
             width, height = img.size
             pixel_count = width * height
             if pixel_count > MAX_IMAGE_PIXELS:
-                print(
-                    f"  [WARN] image too large ({pixel_count:,} px), "
-                    f"fallback to file MD5: {os.path.basename(filepath)}"
+                logger.warning(
+                    "Image too large (%s px), fallback to file MD5: %s",
+                    f"{pixel_count:,}",
+                    os.path.basename(filepath),
                 )
-                return "FILE:" + get_file_md5(filepath)
+                return HashResult("file", get_file_md5(filepath))
 
             img_rgb = img.convert('RGB')
-            raw = img_rgb.tobytes()
 
-            # 分塊餵入 hashlib（避免 hashlib 內部再複製一份）
-            h = hashlib.md5()
-            chunk_size = 1024 * 1024  # 1MB
-            for i in range(0, len(raw), chunk_size):
-                h.update(raw[i:i + chunk_size])
+        # img 已關閉，img_rgb 仍可用
+        raw = img_rgb.tobytes()
+        del img_rgb  # 盡快釋放 PIL Image
 
-            del raw  # 盡快釋放
-            return h.hexdigest()
+        h = hashlib.md5()
+        chunk_size = 1024 * 1024  # 1MB
+        for i in range(0, len(raw), chunk_size):
+            h.update(raw[i:i + chunk_size])
 
-    except Exception as e:
-        print(
-            f"  [WARN] fallback to file MD5: "
-            f"{os.path.basename(filepath)} ({e})"
+        del raw  # 盡快釋放 bytes buffer
+        return HashResult("pixel", h.hexdigest())
+
+    except Image.DecompressionBombError:
+        logger.warning(
+            "Decompression bomb detected, fallback to file MD5: %s",
+            os.path.basename(filepath),
         )
-        return "FILE:" + get_file_md5(filepath)
-    finally:
-        Image.MAX_IMAGE_PIXELS = original_max
+        return HashResult("file", get_file_md5(filepath))
+    except Exception as e:
+        logger.warning(
+            "Cannot decode image, fallback to file MD5: %s (%s)",
+            os.path.basename(filepath),
+            e,
+        )
+        return HashResult("file", get_file_md5(filepath))
 
 
 def compute_hash(filepath: str, ext: str, use_pixel: bool = True) -> str:
@@ -91,11 +113,14 @@ def compute_hash(filepath: str, ext: str, use_pixel: bool = True) -> str:
         filepath: 檔案路徑
         ext: 副檔名 (小寫, 含點號)
         use_pixel: 是否對圖片使用像素比對
+
+    Returns:
+        hash 字串（pixel hash 為純 hex，file hash 帶 "FILE:" 前綴）
     """
     if use_pixel and ext in IMAGE_EXTENSIONS:
-        return get_pixel_hash(filepath)
+        return str(get_pixel_hash(filepath))
     else:
-        return "FILE:" + get_file_md5(filepath)
+        return f"FILE:{get_file_md5(filepath)}"
 
 
 def init_heic_support() -> bool:
@@ -105,5 +130,6 @@ def init_heic_support() -> bool:
         register_heif_opener()
         return True
     except ImportError:
-        IMAGE_EXTENSIONS.discard('.heic')
+        # 不修改 IMAGE_EXTENSIONS，避免測試與執行期出現全域副作用。
+        # 無 HEIC 解碼器時，compute_hash() 會在 get_pixel_hash() 中自動 fallback。
         return False

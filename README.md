@@ -11,7 +11,7 @@ Find and remove duplicate photos in your Google Photos backup (or any photo dire
 - **Smart file retention** — Keeps the largest file in each duplicate group (preserves the most complete metadata)
 - **Readable rename** — Renames kept files to the most human-readable name (preserves original extension)
 - **Safe deletion** — Moves duplicates to a backup folder (preserving directory structure)
-- **Undo support** — Transaction log (with fsync) enables full rollback with `--undo`
+- **Undo support** — Transaction log uses periodic fsync (every 50 ops) and supports rollback with `--undo`
 - **Path safety** — Validates all paths to prevent directory traversal attacks
 - **JSON output** — Structured `duplicates_data.json` for machine processing
 - **HEIC support** — Optional support for Apple HEIC photos via `pillow-heif`
@@ -99,7 +99,7 @@ Other files (.mp4 .mov .gif .3gp etc.)
 | **Path validation** | Rejects absolute paths, `..` traversal, and paths escaping target dir |
 | **Dir mismatch check** | Verifies report's target\_dir matches `--dir` (override with `--force`) |
 | **Backup structure** | Preserves original directory structure in backup folder |
-| **Transaction log** | Every move/rename recorded with fsync; supports `--undo` |
+| **Transaction log** | Every move/rename is recorded, with fsync every 50 ops; supports `--undo` |
 | **Dry run** | `--dry-run` makes zero file system changes (no dirs created) |
 | **Input validation** | Checks directory existence and permissions upfront |
 | **Memory limit** | MAX\_IMAGE\_PIXELS = 60MP (~180MB max per image) |
@@ -118,10 +118,11 @@ Other files (.mp4 .mov .gif .3gp etc.)
 ## Testing
 
 ```bash
-python tests/test_core.py -v
+python -m pytest -v
+python -m ruff check .
 ```
 
-17 tests covering path safety, naming strategy, and end-to-end flow.
+Automated tests cover path safety, naming strategy, scanner behavior, and end-to-end cleanup/undo flow.
 
 ## Requirements
 
