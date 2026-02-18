@@ -82,9 +82,13 @@ def collect_files(
     errors: list[str] = []
 
     if recursive:
+        def _walk_onerror(e: OSError) -> None:
+            location = e.filename or target_dir
+            errors.append(f"{location}: {e}")
+
         # followlinks=False: 防止符號連結逃逸目標目錄
         for dirpath, dirnames, filenames in os.walk(
-            target_dir, followlinks=False,
+            target_dir, followlinks=False, onerror=_walk_onerror,
         ):
             # 跳過特定目錄
             dirnames[:] = [

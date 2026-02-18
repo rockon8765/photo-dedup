@@ -36,7 +36,6 @@ from photo_dedup.naming import find_best_name, readability_score
 from photo_dedup.scanner import FileEntry, build_groups, collect_files, scan
 from photo_dedup.utils import format_size
 
-
 # ── 路徑安全性 ──────────────────────────────────
 
 
@@ -658,6 +657,79 @@ class TestEndToEnd:
         with pytest.raises(InvalidReportError, match="Invalid transaction log"):
             undo(target_dir=self.test_dir, backup_dir=backup_dir, auto_yes=True)
 
+    def test_undo_rejects_missing_events_when_counts_exist(self):
+        """若 meta 顯示已有操作但 events 檔遺失，undo 應拒絕假成功"""
+        report = {
+            "version": "1.3.0",
+            "scan_time": "2026-01-01",
+            "target_dir": self.test_dir,
+            "settings": {},
+            "summary": {},
+            "groups": [
+                {
+                    "hash": "abc",
+                    "keep": {"path": "a.txt", "size": 11},
+                    "delete": [{"path": "b.txt", "size": 11}],
+                }
+            ],
+        }
+        json_path = os.path.join(self.test_dir, "duplicates_data.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report, f)
+
+        clean(
+            target_dir=self.test_dir,
+            json_path=json_path,
+            auto_yes=True,
+            do_rename=False,
+        )
+
+        backup_dir = os.path.join(self.test_dir, "_duplicates_backup")
+        events_path = os.path.join(backup_dir, "_cleanup_log.events.jsonl")
+        os.remove(events_path)
+
+        with pytest.raises(InvalidReportError, match="events"):
+            undo(target_dir=self.test_dir, backup_dir=backup_dir, auto_yes=True)
+
+    def test_clean_wraps_backup_permission_error(self, monkeypatch):
+        """backup dir 無法建立時，clean 應拋出 AccessDeniedError"""
+        report = {
+            "version": "1.3.0",
+            "scan_time": "2026-01-01",
+            "target_dir": self.test_dir,
+            "settings": {},
+            "summary": {},
+            "groups": [
+                {
+                    "hash": "abc",
+                    "keep": {"path": "a.txt", "size": 11},
+                    "delete": [{"path": "b.txt", "size": 11}],
+                }
+            ],
+        }
+        json_path = os.path.join(self.test_dir, "duplicates_data.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report, f)
+
+        backup_dir = os.path.join(self.test_dir, "_duplicates_backup")
+        real_makedirs = os.makedirs
+
+        def fake_makedirs(path, exist_ok=False):
+            if os.path.abspath(path) == os.path.abspath(backup_dir):
+                raise PermissionError("no permission to create backup dir")
+            return real_makedirs(path, exist_ok=exist_ok)
+
+        monkeypatch.setattr("photo_dedup.cleaner.os.makedirs", fake_makedirs)
+
+        with pytest.raises(AccessDeniedError, match="Backup directory"):
+            clean(
+                target_dir=self.test_dir,
+                json_path=json_path,
+                backup_dir=backup_dir,
+                auto_yes=True,
+                do_rename=False,
+            )
+
 
 # ── Hasher 行為 ─────────────────────────────────
 
@@ -771,6 +843,25 @@ class TestCollectFiles:
         assert isinstance(entry, FileEntry)
         assert entry.ext == ".jpg"
         assert entry.size == 3
+
+    def test_recursive_collect_reports_walk_permission_error(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """遞迴掃描遇到 walk 權限錯誤時，應在 errors 中回報"""
+
+        def fake_walk(_target_dir, followlinks=False, onerror=None):
+            assert followlinks is False
+            if onerror:
+                onerror(PermissionError("permission denied"))
+            yield str(tmp_path), [], []
+
+        monkeypatch.setattr("photo_dedup.scanner.os.walk", fake_walk)
+
+        files, errors = collect_files(str(tmp_path), recursive=True)
+        assert files == []
+        assert any("permission denied" in err for err in errors)
 
 
 class TestScannerBehavior:

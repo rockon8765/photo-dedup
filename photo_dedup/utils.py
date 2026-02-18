@@ -2,7 +2,6 @@
 
 from . import __version__
 
-
 VERSION = __version__
 
 

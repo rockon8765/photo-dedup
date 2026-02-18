@@ -170,7 +170,8 @@ def _validate_all_paths(groups: list[dict], target_dir: str):
                     )
                 if delete_abs in seen_abs_paths:
                     raise InvalidReportError(
-                        f"Duplicate path in report (group #{i + 1} delete): {delete_path}"
+                        "Duplicate path in report "
+                        f"(group #{i + 1} delete): {delete_path}"
                     )
                 group_abs_paths.add(delete_abs)
                 seen_abs_paths.add(delete_abs)
@@ -301,7 +302,17 @@ def _load_undo_entries(log: dict, backup_dir: str) -> tuple[list[dict], list[dic
     events_path = os.path.join(backup_dir, events_file)
 
     if not os.path.isfile(events_path):
-        return log.get("renames", []), log.get("moves", [])
+        if "renames" in log or "moves" in log:
+            return log.get("renames", []), log.get("moves", [])
+
+        move_count = log.get("move_count", 0) or 0
+        rename_count = log.get("rename_count", 0) or 0
+        if move_count > 0 or rename_count > 0:
+            raise InvalidReportError(
+                f"Missing events log: {events_path}. "
+                "Cannot safely undo without recorded events."
+            )
+        return [], []
 
     renames = []
     moves = []
@@ -420,7 +431,7 @@ def load_json_report(json_path: str) -> dict:
 
     if "groups" not in data:
         raise InvalidReportError(
-            f"Invalid report format: missing 'groups' key"
+            "Invalid report format: missing 'groups' key"
         )
 
     return data
@@ -536,7 +547,12 @@ def clean(
             return
 
     # 檢查是否已有未完成的 event log，防止覆蓋
-    os.makedirs(backup_dir, exist_ok=True)
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+    except OSError as e:
+        raise AccessDeniedError(
+            f"Backup directory is not writable: {backup_dir} ({e})"
+        )
     log_path = os.path.join(backup_dir, LOG_META_FILENAME)
     events_path = os.path.join(backup_dir, LOG_EVENTS_FILENAME)
 
@@ -557,7 +573,14 @@ def clean(
     log = _init_log(target_dir, backup_dir)
     _save_log_meta(log, log_path)  # 開始前先落盤
     pending_ops = 0
-    with open(events_path, 'w', encoding='utf-8') as events_fp:
+    try:
+        events_fp = open(events_path, 'w', encoding='utf-8')
+    except OSError as e:
+        raise AccessDeniedError(
+            f"Cannot write transaction events log: {events_path} ({e})"
+        )
+
+    with events_fp:
         # --- Phase A: 移動重複檔案 ---
         logger.info("[1/2] Moving duplicates to backup...")
 
@@ -581,7 +604,12 @@ def clean(
             # 保留來源目錄結構
             dest = os.path.join(backup_dir, rel_path)
             dest_dir = os.path.dirname(dest)
-            os.makedirs(dest_dir, exist_ok=True)
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+            except OSError as e:
+                skipped += 1
+                move_errors.append((rel_path, f"mkdir failed: {e}"))
+                continue
 
             # 處理同名衝突
             if os.path.exists(dest):
