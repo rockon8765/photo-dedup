@@ -6,6 +6,7 @@ Usage:
     python scan.py --dir <PHOTO_DIR>
     python scan.py --dir <PHOTO_DIR> --output <OUTPUT_DIR>
     python scan.py --dir <PHOTO_DIR> --no-pixel
+    python scan.py --dir <PHOTO_DIR> --strict-verify
     python scan.py --dir <PHOTO_DIR> --no-recursive
 """
 
@@ -44,6 +45,7 @@ Examples:
   python scan.py --dir /path/to/photos
   python scan.py --dir /path/to/photos --output /path/to/reports
   python scan.py --dir /path/to/photos --no-pixel
+  python scan.py --dir /path/to/photos --strict-verify
   python scan.py --dir /path/to/photos --no-recursive
         """,
     )
@@ -67,6 +69,14 @@ Examples:
         action="store_true",
         help="Don't scan subdirectories / 不掃描子資料夾",
     )
+    parser.add_argument(
+        "--strict-verify",
+        action="store_true",
+        help=(
+            "Byte-verify FILE hash matches to avoid false positives "
+            "(slower, safer) / 對 FILE hash 命中做逐位元組驗證"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -76,6 +86,7 @@ Examples:
             output_dir=args.output,
             use_pixel=not args.no_pixel,
             recursive=not args.no_recursive,
+            strict_verify=args.strict_verify,
         )
     except PhotoDedupError as e:
         print(f"\nERROR: {e}", file=sys.stderr)

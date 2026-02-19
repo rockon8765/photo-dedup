@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
+import photo_dedup.scanner as scanner_module
 from photo_dedup.cleaner import (
     _build_fast_root_checker,
     _validate_relative_path,
@@ -34,7 +35,7 @@ from photo_dedup.exceptions import (
     InvalidReportError,
     PathTraversalError,
 )
-from photo_dedup.hasher import IMAGE_EXTENSIONS, init_heic_support
+from photo_dedup.hasher import IMAGE_EXTENSIONS, get_pixel_hash, init_heic_support
 from photo_dedup.metadata import (
     generate_date_filename,
     get_earliest_date,
@@ -159,6 +160,10 @@ class TestNaming:
     def test_camera_prefix_bonus(self):
         """IMG_ DSC_ 等前綴應加分"""
         assert readability_score("IMG_20210103.jpg") > readability_score("12345.jpg")
+
+    def test_invalid_date_string_gets_no_date_bonus(self):
+        """非法日期字串不應拿到日期加分（避免命名排序偏誤）"""
+        assert readability_score("99991399.jpg") < 0
 
     def test_find_best_name_keeps_extension(self):
         """改名應保留 keep 檔的原始副檔名"""
@@ -650,6 +655,31 @@ class TestEndToEnd:
             undo(target_dir=self.test_dir, backup_dir=backup_dir, auto_yes=True)
         finally:
             builtins.input = orig_input
+
+    def test_undo_emits_logger_output(self, caplog):
+        """undo 應透過 logger 輸出，便於統一收集與測試驗證"""
+        backup_dir = os.path.join(self.test_dir, "_duplicates_backup")
+        os.makedirs(backup_dir, exist_ok=True)
+        log_path = os.path.join(backup_dir, "_cleanup_log.json")
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "version": "1.3.0",
+                    "target_dir": self.test_dir,
+                    "backup_dir": backup_dir,
+                    "status": "complete",
+                    "moves": [],
+                    "renames": [],
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        with caplog.at_level(logging.INFO):
+            undo(target_dir=self.test_dir, backup_dir=backup_dir, auto_yes=True)
+
+        assert "Undo complete!" in caplog.text
 
     def test_undo_rejects_path_outside_roots(self):
         """undo 應拒絕 log 中逸出 target/backup 的路徑"""
@@ -1364,6 +1394,41 @@ class TestHasherBehavior:
         """IMAGE_EXTENSIONS 應為 frozenset，不可被意外修改"""
         assert isinstance(IMAGE_EXTENSIONS, frozenset)
 
+    def test_pixel_hash_normalizes_exif_orientation(self, tmp_path):
+        """
+        像素 hash 應先套用 EXIF orientation，讓視覺相同的圖得到同一 hash。
+        """
+        from PIL import Image
+
+        base = Image.new("RGB", (2, 3))
+        pixels = base.load()
+        colors = [
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (255, 255, 0),
+            (0, 255, 255),
+            (255, 0, 255),
+        ]
+        idx = 0
+        for y in range(3):
+            for x in range(2):
+                pixels[x, y] = colors[idx]
+                idx += 1
+
+        base_path = tmp_path / "base.png"
+        base.save(base_path)
+
+        rotated_raw = base.rotate(90, expand=True)
+        exif = rotated_raw.getexif()
+        exif[274] = 6  # Orientation=6 (display rotate 90 CW)
+        exif_path = tmp_path / "rotated_with_exif.png"
+        rotated_raw.save(exif_path, exif=exif)
+
+        h1 = str(get_pixel_hash(str(base_path)))
+        h2 = str(get_pixel_hash(str(exif_path)))
+        assert h1 == h2
+
 
 # ── 工具函式 ────────────────────────────────────
 
@@ -1503,3 +1568,105 @@ class TestScannerBehavior:
 
         groups = build_groups(dup_groups, size_map, str(tmp_path))
         assert groups[0]["keep"]["path"] == "a.txt"
+
+    def test_non_image_uses_partial_hash_before_full_md5(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """
+        非影像檔應先做 partial hash 篩選，再對候選做 full MD5。
+        預期只會對真正 size+partial 相同的檔案呼叫 full hash。
+        """
+        (tmp_path / "a1.bin").write_bytes(b"A" * 128 + b"TAIL_A")
+        (tmp_path / "a2.bin").write_bytes(b"A" * 128 + b"TAIL_A")
+        (tmp_path / "b1.bin").write_bytes(b"B" * 128 + b"TAIL_B")
+        (tmp_path / "b2.bin").write_bytes(b"C" * 128 + b"TAIL_C")
+
+        original_compute_hash = scanner_module.compute_hash
+        full_hash_calls: list[str] = []
+
+        def counting_compute_hash(filepath: str, ext: str, use_pixel: bool = True):
+            full_hash_calls.append(os.path.basename(filepath))
+            return original_compute_hash(filepath, ext, use_pixel)
+
+        monkeypatch.setattr(scanner_module, "compute_hash", counting_compute_hash)
+
+        scan(
+            target_dir=str(tmp_path),
+            output_dir=str(tmp_path),
+            use_pixel=False,
+            recursive=True,
+        )
+
+        assert sorted(full_hash_calls) == ["a1.bin", "a2.bin"]
+
+    def test_strict_verify_splits_same_hash_but_different_content(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """
+        strict verify 開啟時，若 FILE hash 相同但實際 bytes 不同，應拆組避免誤判。
+        """
+        (tmp_path / "same1.txt").write_text("alpha", encoding="utf-8")
+        (tmp_path / "same2.txt").write_text("alpha", encoding="utf-8")
+        (tmp_path / "diff1.txt").write_text("bravo", encoding="utf-8")
+
+        monkeypatch.setattr(
+            scanner_module,
+            "get_file_partial_md5",
+            lambda filepath, chunk_size=65536: "PARTIAL:forced",
+        )
+        monkeypatch.setattr(
+            scanner_module,
+            "compute_hash",
+            lambda filepath, ext, use_pixel=True: "FILE:forced_collision",
+        )
+
+        scan(
+            target_dir=str(tmp_path),
+            output_dir=str(tmp_path),
+            use_pixel=False,
+            recursive=True,
+            strict_verify=True,
+        )
+
+        json_path = tmp_path / "duplicates_data.json"
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        assert data["summary"]["duplicate_groups"] == 1
+        assert data["summary"]["deletable_files"] == 1
+        members = {
+            data["groups"][0]["keep"]["path"],
+            *[d["path"] for d in data["groups"][0]["delete"]],
+        }
+        assert members == {"same1.txt", "same2.txt"}
+
+    def test_scan_progress_logs_reach_100_percent_after_prefilter(
+        self,
+        tmp_path,
+        monkeypatch,
+        caplog,
+    ):
+        """
+        partial prefilter 後，進度總量應以實際工作量計算，最終可達 100%。
+        """
+        (tmp_path / "a1.bin").write_bytes(b"A" * 128 + b"TAIL_A")
+        (tmp_path / "a2.bin").write_bytes(b"A" * 128 + b"TAIL_A")
+        (tmp_path / "b1.bin").write_bytes(b"B" * 128 + b"TAIL_B")
+        (tmp_path / "b2.bin").write_bytes(b"C" * 128 + b"TAIL_C")
+
+        monkeypatch.setattr(scanner_module, "HASH_PROGRESS_INTERVAL", 1, raising=False)
+
+        with caplog.at_level(logging.INFO):
+            scan(
+                target_dir=str(tmp_path),
+                output_dir=str(tmp_path),
+                use_pixel=False,
+                recursive=True,
+            )
+
+        assert "Progress:" in caplog.text
+        assert "(100%)" in caplog.text

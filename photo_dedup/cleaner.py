@@ -1179,24 +1179,24 @@ def undo(
     ])
     step = 0
 
-    print("="* 50)
-    print("Photo Dedup - Undo")
-    print("=" * 50)
-    print(f"  Renames to revert:      {len(renames)}")
-    print(f"  Moves to revert:        {len(moves)}")
-    print(f"  Date updates to revert: {len(date_updates)}")
-    print()
+    logger.info("=" * 50)
+    logger.info("Photo Dedup - Undo")
+    logger.info("=" * 50)
+    logger.info("  Renames to revert:      %d", len(renames))
+    logger.info("  Moves to revert:        %d", len(moves))
+    logger.info("  Date updates to revert: %d", len(date_updates))
+    logger.info("")
 
     if not auto_yes:
         answer = input("Proceed with undo? (y/N) ").strip().lower()
         if answer != 'y':
-            print("Cancelled.")
+            logger.info("Cancelled.")
             return
 
     # 1. 還原日期 (逆序，最先還原以便後續改名/移動能保留正確時間)
     if date_updates:
         step += 1
-        print(f"\n[{step}/{total_steps}] Reverting date updates...")
+        logger.info("[%d/%d] Reverting date updates...", step, total_steps)
         reverted_dates = 0
         for entry in reversed(date_updates):
             filepath = entry["path"]
@@ -1206,13 +1206,13 @@ def undo(
                     os.utime(filepath, (old_mtime, old_mtime))
                     reverted_dates += 1
                 except Exception as e:
-                    print(f"  [ERROR] {filepath}: {e}")
-        print(f"  Reverted {reverted_dates} date updates")
+                    logger.error("  [ERROR] %s: %s", filepath, e)
+        logger.info("  Reverted %d date updates", reverted_dates)
 
     # 2. 還原改名 (逆序)
     if renames:
         step += 1
-        print(f"\n[{step}/{total_steps}] Reverting renames...")
+        logger.info("[%d/%d] Reverting renames...", step, total_steps)
         reverted = 0
         for entry in reversed(renames):
             src = entry["to"]
@@ -1222,13 +1222,13 @@ def undo(
                     os.rename(src, dst)
                     reverted += 1
                 except Exception as e:
-                    print(f"  [ERROR] {src}: {e}")
-        print(f"  Reverted {reverted} renames")
+                    logger.error("  [ERROR] %s: %s", src, e)
+        logger.info("  Reverted %d renames", reverted)
 
     # 3. 還原移動 (逆序)
     if moves:
         step += 1
-        print(f"\n[{step}/{total_steps}] Restoring moved files...")
+        logger.info("[%d/%d] Restoring moved files...", step, total_steps)
         restored = 0
         for entry in reversed(moves):
             src = entry["to"]
@@ -1240,12 +1240,12 @@ def undo(
                     shutil.move(src, dst)
                     restored += 1
                 except Exception as e:
-                    print(f"  [ERROR] {src}: {e}")
+                    logger.error("  [ERROR] %s: %s", src, e)
 
             if restored % 500 == 0 and restored > 0:
-                print(f"  Restored {restored} files...")
+                logger.info("  Restored %d files...", restored)
 
-        print(f"  Restored {restored} files")
+        logger.info("  Restored %d files", restored)
 
     # 清理還原後殘留的空備份子目錄
     _prune_empty_subdirs(backup_dir)
@@ -1255,5 +1255,5 @@ def undo(
     log["undo_time"] = datetime.now(timezone.utc).isoformat()
     _save_log_meta(log, log_path)
 
-    print()
-    print("Undo complete!")
+    logger.info("")
+    logger.info("Undo complete!")

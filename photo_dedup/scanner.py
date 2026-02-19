@@ -5,8 +5,9 @@
   1. 驗證輸入參數
   2. 用 os.walk (遞迴) 或 os.scandir (平面) 收集所有檔案
   3. 非圖片檔按大小分組預篩（大小不同不可能重複）
-  4. 計算 hash（圖片: 像素 MD5 / 其他: 全檔 MD5）
-  5. 產出 JSON 結構化報告 + 可讀文字報告
+  4. 非圖片先做 partial hash，再對候選做全檔 MD5
+  5. 計算 hash（圖片: 像素 MD5 / 其他: 全檔 MD5）
+  6. 產出 JSON 結構化報告 + 可讀文字報告
 """
 
 import json
@@ -19,10 +20,17 @@ from datetime import datetime, timezone
 from typing import NamedTuple
 
 from .exceptions import AccessDeniedError, DirectoryNotFoundError
-from .hasher import IMAGE_EXTENSIONS, compute_hash, init_heic_support
+from .hasher import (
+    IMAGE_EXTENSIONS,
+    compute_hash,
+    get_file_partial_md5,
+    init_heic_support,
+)
 from .utils import SCAN_SKIP_DIR_NAMES, VERSION, format_size
 
 logger = logging.getLogger(__name__)
+
+HASH_PROGRESS_INTERVAL = 1000
 
 
 class FileEntry(NamedTuple):
@@ -158,15 +166,66 @@ def _hash_one(args: tuple[str, str, bool]) -> tuple[str, str] | None:
         return None
 
 
+def _partial_hash_one(path: str) -> tuple[str, str] | None:
+    """Worker for non-image partial hash stage."""
+    try:
+        return (path, get_file_partial_md5(path))
+    except Exception as e:
+        logger.error("Partial hash failed: %s: %s", os.path.basename(path), e)
+        return None
+
+
+def _files_identical(path_a: str, path_b: str, chunk_size: int = 65536) -> bool:
+    """
+    Byte-by-byte comparison for strict verification.
+
+    Any I/O error is treated as non-identical (safe default: don't dedup).
+    """
+    if path_a == path_b:
+        return True
+
+    try:
+        if os.path.getsize(path_a) != os.path.getsize(path_b):
+            return False
+    except OSError as e:
+        logger.warning(
+            "Strict verify size check failed: %s vs %s (%s)",
+            os.path.basename(path_a),
+            os.path.basename(path_b),
+            e,
+        )
+        return False
+
+    try:
+        with open(path_a, "rb") as fa, open(path_b, "rb") as fb:
+            while True:
+                chunk_a = fa.read(chunk_size)
+                chunk_b = fb.read(chunk_size)
+                if chunk_a != chunk_b:
+                    return False
+                if not chunk_a:
+                    return True
+    except OSError as e:
+        logger.warning(
+            "Strict verify read failed: %s vs %s (%s)",
+            os.path.basename(path_a),
+            os.path.basename(path_b),
+            e,
+        )
+        return False
+
+
 def compute_hashes(
-    candidates: list[FileEntry],
+    image_candidates: list[FileEntry],
+    non_image_candidates: list[FileEntry],
     use_pixel: bool,
-    total: int,
 ) -> tuple[dict[str, list[str]], dict[str, int]]:
     """
     計算所有候選檔案的 hash。
-    圖片檔使用 ProcessPoolExecutor (CPU-bound)，
-    非圖片檔使用 ThreadPoolExecutor (I/O-bound)。
+    圖片檔使用 ProcessPoolExecutor (CPU-bound)。
+    非圖片檔採兩階段：
+      1) partial hash 預篩（ThreadPool）
+      2) 只有 size+partial 命中的檔案才做 full MD5（ThreadPool）
 
     Returns:
         (hash_groups, size_map)
@@ -176,16 +235,26 @@ def compute_hashes(
     processed = 0
     errors = 0
     start_time = time.time()
+    total_ops = len(image_candidates) + len(non_image_candidates)
 
-    # 分離圖片和非圖片候選
-    image_candidates = [
-        e for e in candidates
-        if use_pixel and e.ext in IMAGE_EXTENSIONS
-    ]
-    non_image_candidates = [
-        e for e in candidates
-        if not (use_pixel and e.ext in IMAGE_EXTENSIONS)
-    ]
+    def _log_progress(force: bool = False) -> None:
+        nonlocal processed
+        if processed == 0:
+            return
+        if not force and processed % HASH_PROGRESS_INTERVAL != 0:
+            return
+
+        elapsed = time.time() - start_time
+        speed = processed / elapsed if elapsed > 0 else 0
+        safe_total = max(total_ops, processed)
+        remaining = (safe_total - processed) / speed if speed > 0 else 0
+        logger.info(
+            "Progress: %d/%d (%d%%) ETA: %.0fs",
+            processed,
+            safe_total,
+            processed * 100 // safe_total,
+            remaining,
+        )
 
     def _process_results(
         results,
@@ -200,21 +269,49 @@ def compute_hashes(
             else:
                 errors += 1
             processed += 1
-            if processed % 1000 == 0:
-                elapsed = time.time() - start_time
-                speed = processed / elapsed if elapsed > 0 else 0
-                remaining = (total - processed) / speed if speed > 0 else 0
-                logger.info(
-                    "Progress: %d/%d (%d%%) ETA: %.0fs",
-                    processed, total, processed * 100 // total, remaining,
-                )
+            _log_progress()
 
-    # 非圖片: I/O-bound, 用 ThreadPoolExecutor
+    # 非圖片: 先 partial hash，再只對 size+partial 命中的檔案做 full hash
     if non_image_candidates:
-        args_list = [(e.path, e.ext, use_pixel) for e in non_image_candidates]
+        logger.info(
+            "  Non-image partial hash prefilter: %d files",
+            len(non_image_candidates),
+        )
+        partial_groups: dict[tuple[int, str], list[FileEntry]] = defaultdict(list)
         with ThreadPoolExecutor() as pool:
-            results = pool.map(_hash_one, args_list)
-        _process_results(results, non_image_candidates)
+            partial_results = pool.map(
+                _partial_hash_one,
+                [e.path for e in non_image_candidates],
+            )
+
+        for entry, result in zip(non_image_candidates, partial_results):
+            if result is None:
+                errors += 1
+            else:
+                _, partial_hash = result
+                partial_groups[(entry.size, partial_hash)].append(entry)
+            processed += 1
+            _log_progress()
+
+        full_hash_candidates: list[FileEntry] = []
+        for files in partial_groups.values():
+            if len(files) > 1:
+                full_hash_candidates.extend(files)
+
+        total_ops += len(full_hash_candidates)
+
+        logger.info(
+            "  Non-image full MD5 after prefilter: %d files",
+            len(full_hash_candidates),
+        )
+
+        if full_hash_candidates:
+            args_list = [
+                (e.path, e.ext, use_pixel) for e in full_hash_candidates
+            ]
+            with ThreadPoolExecutor() as pool:
+                results = pool.map(_hash_one, args_list)
+            _process_results(results, full_hash_candidates)
 
     # 圖片: CPU-bound, 用 ProcessPoolExecutor
     if image_candidates:
@@ -232,9 +329,63 @@ def compute_hashes(
             results = (_hash_one(a) for a in args_list)
             _process_results(results, image_candidates)
 
+    _log_progress(force=True)
     elapsed = time.time() - start_time
     logger.info("Done! %.1fs, %d errors", elapsed, errors)
     return hash_groups, size_map
+
+
+def strict_verify_file_hash_groups(
+    hash_groups: dict[str, list[str]],
+    size_map: dict[str, int],
+) -> dict[str, list[str]]:
+    """
+    對 FILE hash 群組做 byte-by-byte 最終確認，避免 hash collision 誤判。
+
+    若同一 FILE hash 中出現內容不一致，會拆成多個子群組。
+    """
+    verified: dict[str, list[str]] = {}
+    split_group_count = 0
+
+    for h, files in hash_groups.items():
+        if not h.startswith("FILE:") or len(files) <= 1:
+            verified[h] = files
+            continue
+
+        subgroups: list[list[str]] = []
+        for path in files:
+            assigned = False
+            for subgroup in subgroups:
+                rep = subgroup[0]
+                if size_map.get(path) != size_map.get(rep):
+                    continue
+                if _files_identical(path, rep):
+                    subgroup.append(path)
+                    assigned = True
+                    break
+
+            if not assigned:
+                subgroups.append([path])
+
+        if len(subgroups) == 1:
+            verified[h] = subgroups[0]
+            continue
+
+        split_group_count += 1
+        for idx, subgroup in enumerate(subgroups, 1):
+            key = h if idx == 1 else f"{h}::verify{idx}"
+            while key in verified:
+                idx += 1
+                key = f"{h}::verify{idx}"
+            verified[key] = subgroup
+
+    if split_group_count > 0:
+        logger.warning(
+            "Strict verify split %d FILE hash group(s) due to byte mismatch",
+            split_group_count,
+        )
+
+    return verified
 
 
 def build_groups(
@@ -359,6 +510,7 @@ def scan(
     output_dir: str | None = None,
     use_pixel: bool = True,
     recursive: bool = True,
+    strict_verify: bool = False,
 ):
     """
     主掃描流程。
@@ -368,6 +520,7 @@ def scan(
         output_dir: 報告輸出路徑 (預設 = target_dir)
         use_pixel: 是否使用像素比對 (預設 True)
         recursive: 是否遞迴掃描子資料夾 (預設 True)
+        strict_verify: 是否對 FILE hash 命中做 byte-by-byte 最終確認
 
     Raises:
         DirectoryNotFoundError: 目標資料夾不存在
@@ -386,6 +539,7 @@ def scan(
     settings = {
         "use_pixel": use_pixel,
         "recursive": recursive,
+        "strict_verify": strict_verify,
     }
 
     logger.info("=" * 50)
@@ -395,6 +549,7 @@ def scan(
     logger.info("Output:    %s", output_dir)
     logger.info("Mode:      %s", 'Pixel comparison' if use_pixel else 'File MD5 only')
     logger.info("Recursive: %s", 'Yes' if recursive else 'No')
+    logger.info("Strict verify FILE hash: %s", 'Yes' if strict_verify else 'No')
 
     # Step 1
     logger.info("[1/4] Collecting files...")
@@ -426,10 +581,13 @@ def scan(
     logger.info("[2/4] Categorizing...")
     image_candidates, non_image_candidates = categorize_files(all_files, use_pixel)
 
-    total_to_hash = len(image_candidates) + len(non_image_candidates)
+    total_to_hash = len(image_candidates) + (len(non_image_candidates) * 2)
     logger.info("  Images (pixel hash): %d", len(image_candidates))
-    logger.info("  Non-images (file MD5, size-matched): %d", len(non_image_candidates))
-    logger.info("  Total to process: %d", total_to_hash)
+    logger.info(
+        "  Non-images (size-matched candidates): %d",
+        len(non_image_candidates),
+    )
+    logger.info("  Estimated upper-bound hash operations: %d", total_to_hash)
 
     # HEIC support
     if use_pixel:
@@ -441,10 +599,13 @@ def scan(
 
     # Step 3
     logger.info("[3/4] Computing hashes...")
-    all_candidates = image_candidates + non_image_candidates
     hash_groups, size_map = compute_hashes(
-        all_candidates, use_pixel, total_to_hash
+        image_candidates, non_image_candidates, use_pixel
     )
+
+    if strict_verify:
+        logger.info("[3.5/4] Strict verifying FILE hash groups...")
+        hash_groups = strict_verify_file_hash_groups(hash_groups, size_map)
 
     # Step 4
     logger.info("[4/4] Generating reports...")

@@ -59,6 +59,7 @@ python scan.py --dir <DIR> [options]
 | `--output`, `-o` | Output dir for reports (default: same as `--dir`) |
 | `--no-pixel` | Use file-level MD5 instead of pixel comparison (faster but less accurate) |
 | `--no-recursive` | Only scan the top-level directory, skip subdirectories |
+| `--strict-verify` | Byte-verify `FILE:` hash matches (slower, safer against false positives) |
 
 ### `clean.py` — Safe Deletion + Rename
 
@@ -91,7 +92,9 @@ Image files (.jpg .jpeg .png .heic .webp .dng)
 
 Other files (.mp4 .mov .gif .3gp etc.)
   → Pre-filter by file size (different size = not duplicate)
-  → MD5 of entire file contents
+  → Partial hash (head+tail) prefilter
+  → MD5 of entire file contents (only for size+partial matched files)
+  → Optional `--strict-verify`: byte-by-byte final confirmation for `FILE:` hash matches
 ```
 
 ### Safety Features

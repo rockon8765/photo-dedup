@@ -50,6 +50,35 @@ def get_file_md5(filepath: str, chunk_size: int = 65536) -> str:
     return h.hexdigest()
 
 
+def get_file_partial_md5(filepath: str, chunk_size: int = 65536) -> str:
+    """
+    計算檔案「頭 + 尾」的 partial MD5，用於非圖片預篩。
+
+    - 小檔案 (<= 2 * chunk_size): 直接 hash 全檔
+    - 大檔案: hash 前 chunk + 檔案大小 + 後 chunk
+    """
+    file_size = os.path.getsize(filepath)
+    h = hashlib.md5()
+
+    with open(filepath, "rb") as f:
+        if file_size <= chunk_size * 2:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                h.update(chunk)
+            return h.hexdigest()
+
+        head = f.read(chunk_size)
+        h.update(head)
+        h.update(file_size.to_bytes(8, byteorder="little", signed=False))
+        f.seek(-chunk_size, os.SEEK_END)
+        tail = f.read(chunk_size)
+        h.update(tail)
+
+    return h.hexdigest()
+
+
 def get_pixel_hash(filepath: str) -> HashResult:
     """
     用 Pillow 解碼圖片，取出純像素資料的 MD5。
@@ -62,7 +91,7 @@ def get_pixel_hash(filepath: str) -> HashResult:
 
     不修改全域 Image.MAX_IMAGE_PIXELS，改為函式內自行檢查尺寸。
     """
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     try:
         with Image.open(filepath) as img:
@@ -76,7 +105,14 @@ def get_pixel_hash(filepath: str) -> HashResult:
                 )
                 return HashResult("file", get_file_md5(filepath))
 
-            img_rgb = img.convert('RGB')
+            # 先正規化 EXIF orientation，再做像素比對
+            img_normalized = ImageOps.exif_transpose(img)
+            try:
+                img_rgb = img_normalized.convert('RGB')
+            finally:
+                if img_normalized is not img:
+                    img_normalized.close()
+                del img_normalized
 
         # img 已關閉，img_rgb 仍可用
         raw = img_rgb.tobytes()

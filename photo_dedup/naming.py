@@ -13,6 +13,21 @@ import re
 from pathlib import Path
 
 
+def _extract_valid_ymd_prefix(text: str) -> tuple[int, int, int] | None:
+    """
+    解析字串開頭的日期前綴 (YYYYMMDD / YYYY-MM-DD / YYYY_MM_DD)。
+    只做基本合法性檢查：year 1900-2099, month 1-12, day 1-31。
+    """
+    m = re.match(r'^(\d{4})[-_]?(\d{2})[-_]?(\d{2})', text)
+    if not m:
+        return None
+
+    year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if 1900 <= year <= 2099 and 1 <= month <= 12 and 1 <= day <= 31:
+        return (year, month, day)
+    return None
+
+
 def is_meaningless(filename: str) -> bool:
     """
     判定檔名是否無意義，需要被改為日期格式。
@@ -36,11 +51,8 @@ def is_meaningless(filename: str) -> bool:
         return True
 
     # 有日期格式 → 不是無意義（需驗證月份 01-12、日期 01-31）
-    m = re.match(r'^(\d{4})[-_]?(\d{2})[-_]?(\d{2})', clean_stem)
-    if m:
-        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if 1900 <= year <= 2099 and 1 <= month <= 12 and 1 <= day <= 31:
-            return False
+    if _extract_valid_ymd_prefix(clean_stem):
+        return False
 
     # 有相機前綴 → 不是無意義
     if re.match(
@@ -90,13 +102,21 @@ def readability_score(filename: str) -> float:
     if re.search(r'\(\d+\)', stem):
         score -= 20
 
-    # --- 加分: YYYYMMDD 日期格式 ---
-    if re.match(r'^(\d{4}[-_]?\d{2}[-_]?\d{2})', clean_stem):
+    # --- 加分: YYYYMMDD 日期格式（需合法年月日） ---
+    if _extract_valid_ymd_prefix(clean_stem):
         score += 10
 
-    # --- 加分: YYYYMMDD_HHMMSS 完整日期時間 ---
-    if re.match(r'^\d{8}[_-]\d{6}', clean_stem):
-        score += 5
+    # --- 加分: YYYYMMDD_HHMMSS 完整日期時間（需合法時分秒） ---
+    m_dt = re.match(
+        r'^(\d{4})[-_]?(\d{2})[-_]?(\d{2})[_-](\d{2})(\d{2})(\d{2})',
+        clean_stem,
+    )
+    if m_dt and _extract_valid_ymd_prefix(clean_stem):
+        hour = int(m_dt.group(4))
+        minute = int(m_dt.group(5))
+        second = int(m_dt.group(6))
+        if 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59:
+            score += 5
 
     # --- 加分: 有 IMG_, DSC_ 等相機前綴 ---
     if re.match(
