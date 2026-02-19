@@ -13,6 +13,60 @@ import re
 from pathlib import Path
 
 
+def is_meaningless(filename: str) -> bool:
+    """
+    判定檔名是否無意義，需要被改為日期格式。
+
+    判定條件（任一成立即為 True）：
+      - 純短數字 (1-9 位)：例如 "1", "23", "123456789"
+      - 純 Unix 時間戳 (10-13 位數字)：例如 "1609753382985"
+      - 亂碼：高比例非 ASCII 且無可辨識語義結構
+
+    以下不視為無意義：
+      - 日期格式 (YYYYMMDD)
+      - 相機前綴 (IMG_, DSC_, PANO_, ...)
+      - 含有描述性英文/中文文字
+    """
+    stem = Path(filename).stem
+
+    # 移除副本標記
+    clean_stem = re.sub(r'\s*\(\d+\)', '', stem).strip()
+
+    if not clean_stem:
+        return True
+
+    # 有日期格式 → 不是無意義（需驗證月份 01-12、日期 01-31）
+    m = re.match(r'^(\d{4})[-_]?(\d{2})[-_]?(\d{2})', clean_stem)
+    if m:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1900 <= year <= 2099 and 1 <= month <= 12 and 1 <= day <= 31:
+            return False
+
+    # 有相機前綴 → 不是無意義
+    if re.match(
+        r'^(IMG|DSC|DCIM|PANO|VID|MOV|Screenshot)',
+        clean_stem,
+        re.IGNORECASE,
+    ):
+        return False
+
+    # 純數字（含 Unix 時間戳）→ 無意義
+    if re.match(r'^\d{1,13}$', clean_stem):
+        return True
+
+    # 亂碼偵測：非 ASCII 且無可辨識語義（無英文字母、無 CJK 字元）
+    has_alpha = bool(re.search(r'[a-zA-Z]', clean_stem))
+    has_cjk = bool(re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', clean_stem))
+
+    if not has_alpha and not has_cjk:
+        # 非字母非 CJK，檢查是否高比例非 ASCII
+        non_ascii_count = sum(1 for c in clean_stem if ord(c) > 127)
+        if non_ascii_count > 0 and non_ascii_count / len(clean_stem) > 0.5:
+            return True
+
+    return False
+
+
 def readability_score(filename: str) -> float:
     """
     評估檔名的可讀性。分數越高 = 越可讀。

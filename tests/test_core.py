@@ -14,11 +14,13 @@ import json
 import logging
 import os
 import tempfile
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
 
 from photo_dedup.cleaner import (
+    _build_fast_root_checker,
     _validate_relative_path,
     clean,
     load_json_report,
@@ -28,11 +30,17 @@ from photo_dedup.cleaner import (
 from photo_dedup.exceptions import (
     AccessDeniedError,
     DirectoryMismatchError,
+    InvalidParameterError,
     InvalidReportError,
     PathTraversalError,
 )
 from photo_dedup.hasher import IMAGE_EXTENSIONS, init_heic_support
-from photo_dedup.naming import find_best_name, readability_score
+from photo_dedup.metadata import (
+    generate_date_filename,
+    get_earliest_date,
+    get_file_date,
+)
+from photo_dedup.naming import find_best_name, is_meaningless, readability_score
 from photo_dedup.scanner import FileEntry, build_groups, collect_files, scan
 from photo_dedup.utils import format_size
 
@@ -104,6 +112,33 @@ class TestPathSafety:
         with pytest.raises(PathTraversalError):
             _validate_relative_path("link_out/secret.txt", str(tmp_path))
 
+    def test_fast_root_checker_handles_symlink_root(self, tmp_path):
+        """fast root checker 應處理 root 為 symlink 的情況"""
+        real_root = tmp_path / "real_backup"
+        real_root.mkdir()
+        target_file = real_root / "x.txt"
+        target_file.write_text("x")
+
+        symlink_root = tmp_path / "backup_link"
+        try:
+            os.symlink(real_root, symlink_root, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("Symlink is not supported in this environment")
+
+        is_within = _build_fast_root_checker(str(symlink_root))
+        assert is_within(str(target_file))
+
+    def test_fast_root_checker_boundary_prefix(self, tmp_path):
+        """路徑前綴相似但不在 root 內時應回傳 False"""
+        root = tmp_path / "backup"
+        root.mkdir()
+        outside = tmp_path / "backup_extra" / "x.txt"
+        outside.parent.mkdir()
+        outside.write_text("x")
+
+        is_within = _build_fast_root_checker(str(root))
+        assert not is_within(str(outside))
+
 
 # ── 檔名可讀性 ──────────────────────────────────
 
@@ -160,6 +195,121 @@ class TestNaming:
         )
         assert new_name == "20210103_081230.heic"
         assert should is True
+
+
+class TestIsMeaningless:
+    """is_meaningless 無意義檔名偵測測試"""
+
+    def test_pure_single_digit(self):
+        """單一數字應被判定為無意義"""
+        assert is_meaningless("1.jpg") is True
+        assert is_meaningless("9.png") is True
+
+    def test_pure_short_number(self):
+        """短數字應被判定為無意義"""
+        assert is_meaningless("23.jpg") is True
+        assert is_meaningless("123456789.png") is True
+
+    def test_unix_timestamp(self):
+        """Unix 時間戳應被判定為無意義"""
+        assert is_meaningless("1609753382985.jpeg") is True
+        assert is_meaningless("1609753382.jpg") is True
+
+    def test_date_format_not_meaningless(self):
+        """日期格式不應被判定為無意義"""
+        assert is_meaningless("20210103.jpg") is False
+        assert is_meaningless("2021-01-03.png") is False
+        assert is_meaningless("20210103_081230.jpg") is False
+
+    def test_camera_prefix_not_meaningless(self):
+        """相機前綴不應被判定為無意義"""
+        assert is_meaningless("IMG_001.jpg") is False
+        assert is_meaningless("DSC_1234.jpg") is False
+        assert is_meaningless("Screenshot_2021.png") is False
+
+    def test_descriptive_text_not_meaningless(self):
+        """描述性文字不應被判定為無意義"""
+        assert is_meaningless("family_photo.jpg") is False
+        assert is_meaningless("vacation.png") is False
+
+    def test_cjk_text_not_meaningless(self):
+        """中文/日文名稱不應被判定為無意義"""
+        assert is_meaningless("家庭照片.jpg") is False
+
+    def test_copy_suffix_still_meaningless(self):
+        """有副本標記的純數字仍應判定為無意義"""
+        assert is_meaningless("1 (2).jpg") is True
+
+
+# ── Metadata 日期處理 ──────────────────────────────
+
+
+class TestMetadata:
+    """metadata 模組測試"""
+
+    def test_get_file_date_from_mtime(self, tmp_path):
+        """應從 st_mtime 取得日期"""
+        f = tmp_path / "test.txt"
+        f.write_text("hello")
+        # 設定已知的 mtime
+        target_ts = datetime(2023, 1, 12, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+        os.utime(str(f), (target_ts, target_ts))
+
+        dt = get_file_date(str(f))
+        assert dt is not None
+        assert dt.year == 2023
+        assert dt.month == 1
+        assert dt.day == 12
+
+    def test_get_file_date_nonexistent(self):
+        """不存在的檔案應回傳 None"""
+        assert get_file_date("/nonexistent/path.jpg") is None
+
+    def test_generate_date_filename_basic(self):
+        """基本日期命名"""
+        dt = datetime(2023, 1, 12, tzinfo=timezone.utc)
+        name = generate_date_filename(dt, ".jpg", set())
+        assert name == "20230112.jpg"
+
+    def test_generate_date_filename_conflict(self):
+        """衝突時應加後綴"""
+        dt = datetime(2023, 1, 12, tzinfo=timezone.utc)
+        existing = {"20230112.jpg"}
+        name = generate_date_filename(dt, ".jpg", existing)
+        assert name == "20230112_1.jpg"
+
+    def test_generate_date_filename_multiple_conflicts(self):
+        """多次衝突應持續遞增後綴"""
+        dt = datetime(2023, 1, 12, tzinfo=timezone.utc)
+        existing = {"20230112.jpg", "20230112_1.jpg", "20230112_2.jpg"}
+        name = generate_date_filename(dt, ".jpg", existing)
+        assert name == "20230112_3.jpg"
+
+    def test_generate_date_filename_conflict_limit(self, monkeypatch):
+        """衝突數超過上限時應拋出錯誤"""
+        dt = datetime(2023, 1, 12, tzinfo=timezone.utc)
+        monkeypatch.setattr("photo_dedup.metadata.MAX_DATE_FILENAME_SUFFIX", 2)
+        existing = {"20230112.jpg", "20230112_1.jpg", "20230112_2.jpg"}
+
+        with pytest.raises(ValueError, match="Too many filename conflicts"):
+            generate_date_filename(dt, ".jpg", existing)
+
+    def test_get_earliest_date_picks_minimum(self, tmp_path):
+        """多檔案應取最早日期"""
+        f1 = tmp_path / "a.txt"
+        f2 = tmp_path / "b.txt"
+        f1.write_text("a")
+        f2.write_text("b")
+
+        ts_old = datetime(2020, 6, 1, tzinfo=timezone.utc).timestamp()
+        ts_new = datetime(2024, 3, 15, tzinfo=timezone.utc).timestamp()
+        os.utime(str(f1), (ts_old, ts_old))
+        os.utime(str(f2), (ts_new, ts_new))
+
+        earliest = get_earliest_date([str(f1), str(f2)])
+        assert earliest is not None
+        assert earliest.year == 2020
+        assert earliest.month == 6
 
 
 # ── 端到端流程 ──────────────────────────────────
@@ -449,6 +599,7 @@ class TestEndToEnd:
             json_path=json_path,
             backup_dir=backup_dir,
             auto_yes=True,
+            do_date_rename=False,
         )
 
         # chained rename should complete:
@@ -691,6 +842,71 @@ class TestEndToEnd:
         with pytest.raises(InvalidReportError, match="events"):
             undo(target_dir=self.test_dir, backup_dir=backup_dir, auto_yes=True)
 
+    def test_undo_rejects_missing_events_when_only_date_updates_exist(self):
+        """若只記錄 date_update_count 且 events 遺失，undo 也應拒絕"""
+        backup_dir = os.path.join(self.test_dir, "_duplicates_backup")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        log_path = os.path.join(backup_dir, "_cleanup_log.json")
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "version": "1.4.0",
+                    "target_dir": self.test_dir,
+                    "backup_dir": backup_dir,
+                    "status": "complete",
+                    "events_file": "_cleanup_log.events.jsonl",
+                    "move_count": 0,
+                    "rename_count": 0,
+                    "date_update_count": 1,
+                },
+                f,
+            )
+
+        with pytest.raises(InvalidReportError, match="events"):
+            undo(target_dir=self.test_dir, backup_dir=backup_dir, auto_yes=True)
+
+    def test_undo_rejects_date_update_on_prerename_path(self):
+        """date_update 指向 rename 前路徑時，undo 應拒絕"""
+        backup_dir = os.path.join(self.test_dir, "_duplicates_backup")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        old_path = os.path.join(self.test_dir, "old.txt")
+        new_path = os.path.join(self.test_dir, "new.txt")
+
+        log_path = os.path.join(backup_dir, "_cleanup_log.json")
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "version": "1.4.0",
+                    "target_dir": self.test_dir,
+                    "backup_dir": backup_dir,
+                    "status": "complete",
+                    "events_file": "_cleanup_log.events.jsonl",
+                },
+                f,
+            )
+
+        events_path = os.path.join(backup_dir, "_cleanup_log.events.jsonl")
+        with open(events_path, "w", encoding="utf-8") as f:
+            f.write(
+                json.dumps({"type": "rename", "from": old_path, "to": new_path})
+                + "\n"
+            )
+            f.write(
+                json.dumps(
+                    {
+                        "type": "date_update",
+                        "path": old_path,
+                        "old_mtime": 1.0,
+                        "new_mtime": 2.0,
+                    }
+                ) + "\n"
+            )
+
+        with pytest.raises(InvalidReportError, match="pre-rename"):
+            undo(target_dir=self.test_dir, backup_dir=backup_dir, auto_yes=True)
+
     def test_clean_wraps_backup_permission_error(self, monkeypatch):
         """backup dir 無法建立時，clean 應拋出 AccessDeniedError"""
         report = {
@@ -729,6 +945,397 @@ class TestEndToEnd:
                 auto_yes=True,
                 do_rename=False,
             )
+
+
+# ── Phase C 端到端 ─────────────────────────────
+
+
+class TestPhaseC:
+    """Phase C: 無意義檔名改名 + 最早建立日期 端到端測試"""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        self.test_dir = str(tmp_path)
+
+    def _write_file(self, name: str, content: str, mtime: float | None = None) -> str:
+        path = os.path.join(self.test_dir, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def _make_report(self, groups):
+        report = {
+            "version": "1.4.0",
+            "scan_time": "2026-01-01",
+            "target_dir": self.test_dir,
+            "settings": {},
+            "summary": {},
+            "groups": groups,
+        }
+        json_path = os.path.join(self.test_dir, "duplicates_data.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report, f)
+        return json_path
+
+    def test_phase_c_renames_meaningless_filename(self):
+        """Phase C 應將無意義檔名改為日期格式"""
+        ts = datetime(2023, 7, 15, tzinfo=timezone.utc).timestamp()
+        self._write_file("1.txt", "content_keep", mtime=ts)
+        self._write_file("sub/dup.txt", "content_keep", mtime=ts)
+
+        json_path = self._make_report([
+            {
+                "hash": "abc",
+                "keep": {"path": "1.txt", "size": 12},
+                "delete": [{"path": "sub/dup.txt", "size": 12}],
+            }
+        ])
+
+        clean(
+            target_dir=self.test_dir,
+            json_path=json_path,
+            auto_yes=True,
+            do_rename=False,       # 停用 Phase B，隔離測試 Phase C
+            do_date_rename=True,
+        )
+
+        # "1.txt" 是無意義檔名，應被改為日期格式
+        assert not os.path.exists(os.path.join(self.test_dir, "1.txt"))
+        assert os.path.isfile(os.path.join(self.test_dir, "20230715.txt"))
+
+    def test_phase_c_uses_earliest_date(self):
+        """Phase C 應使用同組中最早的建立日期"""
+        ts_old = datetime(2020, 3, 1, tzinfo=timezone.utc).timestamp()
+        ts_new = datetime(2025, 12, 25, tzinfo=timezone.utc).timestamp()
+
+        self._write_file("1.txt", "same", mtime=ts_new)
+        self._write_file("sub/dup.txt", "same", mtime=ts_old)
+
+        json_path = self._make_report([
+            {
+                "hash": "abc",
+                "keep": {"path": "1.txt", "size": 4},
+                "delete": [{"path": "sub/dup.txt", "size": 4}],
+            }
+        ])
+
+        clean(
+            target_dir=self.test_dir,
+            json_path=json_path,
+            auto_yes=True,
+            do_rename=False,
+            do_date_rename=True,
+        )
+
+        # 檔名應使用最早日期 (2020-03-01)
+        expected = os.path.join(self.test_dir, "20200301.txt")
+        assert os.path.isfile(expected)
+
+        # mtime 也應設為最早值
+        actual_mtime = os.path.getmtime(expected)
+        assert abs(actual_mtime - ts_old) < 2.0
+
+    def test_phase_c_sets_earliest_mtime_even_without_rename(self):
+        """即使檔名不是無意義的，也應設定最早 mtime"""
+        ts_old = datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp()
+        ts_new = datetime(2025, 6, 15, tzinfo=timezone.utc).timestamp()
+
+        self._write_file("family_photo.txt", "same", mtime=ts_new)
+        self._write_file("sub/dup.txt", "same", mtime=ts_old)
+
+        json_path = self._make_report([
+            {
+                "hash": "abc",
+                "keep": {"path": "family_photo.txt", "size": 4},
+                "delete": [{"path": "sub/dup.txt", "size": 4}],
+            }
+        ])
+
+        clean(
+            target_dir=self.test_dir,
+            json_path=json_path,
+            auto_yes=True,
+            do_rename=False,
+            do_date_rename=True,
+        )
+
+        # 檔名應保持不變（非無意義）
+        kept = os.path.join(self.test_dir, "family_photo.txt")
+        assert os.path.isfile(kept)
+
+        # mtime 應設為最早值
+        actual_mtime = os.path.getmtime(kept)
+        assert abs(actual_mtime - ts_old) < 2.0
+
+    def test_phase_c_skip_with_flag(self):
+        """--no-date-rename 時應跳過 Phase C"""
+        ts = datetime(2023, 7, 15, tzinfo=timezone.utc).timestamp()
+        self._write_file("1.txt", "content", mtime=ts)
+        self._write_file("sub/dup.txt", "content", mtime=ts)
+
+        json_path = self._make_report([
+            {
+                "hash": "abc",
+                "keep": {"path": "1.txt", "size": 7},
+                "delete": [{"path": "sub/dup.txt", "size": 7}],
+            }
+        ])
+
+        clean(
+            target_dir=self.test_dir,
+            json_path=json_path,
+            auto_yes=True,
+            do_rename=False,
+            do_date_rename=False,
+        )
+
+        # 檔名不應被改變
+        assert os.path.isfile(os.path.join(self.test_dir, "1.txt"))
+
+    def test_undo_reverts_phase_c_rename(self):
+        """undo 應還原 Phase C 的改名"""
+        ts = datetime(2023, 7, 15, tzinfo=timezone.utc).timestamp()
+        self._write_file("1.txt", "content_keep", mtime=ts)
+        self._write_file("sub/dup.txt", "content_keep", mtime=ts)
+
+        json_path = self._make_report([
+            {
+                "hash": "abc",
+                "keep": {"path": "1.txt", "size": 12},
+                "delete": [{"path": "sub/dup.txt", "size": 12}],
+            }
+        ])
+
+        backup_dir = os.path.join(self.test_dir, "_duplicates_backup")
+        clean(
+            target_dir=self.test_dir,
+            json_path=json_path,
+            backup_dir=backup_dir,
+            auto_yes=True,
+            do_rename=False,
+            do_date_rename=True,
+        )
+
+        # 確認改名已發生
+        assert not os.path.exists(os.path.join(self.test_dir, "1.txt"))
+        assert os.path.isfile(os.path.join(self.test_dir, "20230715.txt"))
+
+        # 執行 undo
+        undo(target_dir=self.test_dir, backup_dir=backup_dir, auto_yes=True)
+
+        # 檔名應還原
+        assert os.path.isfile(os.path.join(self.test_dir, "1.txt"))
+        # 重複檔也應還原
+        assert os.path.isfile(os.path.join(self.test_dir, "sub", "dup.txt"))
+
+    def test_undo_reverts_phase_c_mtime(self):
+        """undo 應還原 Phase C 設定的 mtime"""
+        ts_old = datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp()
+        ts_new = datetime(2025, 6, 15, tzinfo=timezone.utc).timestamp()
+
+        self._write_file("family_photo.txt", "same", mtime=ts_new)
+        self._write_file("sub/dup.txt", "same", mtime=ts_old)
+
+        json_path = self._make_report([
+            {
+                "hash": "abc",
+                "keep": {"path": "family_photo.txt", "size": 4},
+                "delete": [{"path": "sub/dup.txt", "size": 4}],
+            }
+        ])
+
+        backup_dir = os.path.join(self.test_dir, "_duplicates_backup")
+        clean(
+            target_dir=self.test_dir,
+            json_path=json_path,
+            backup_dir=backup_dir,
+            auto_yes=True,
+            do_rename=False,
+            do_date_rename=True,
+        )
+
+        # mtime 應已被改為 ts_old
+        kept = os.path.join(self.test_dir, "family_photo.txt")
+        assert abs(os.path.getmtime(kept) - ts_old) < 2.0
+
+        # undo
+        undo(target_dir=self.test_dir, backup_dir=backup_dir, auto_yes=True)
+
+        # mtime 應還原為 ts_new
+        assert abs(os.path.getmtime(kept) - ts_new) < 2.0
+
+    def test_phase_c_handles_filename_conflict(self):
+        """Phase C(all-files) 遇到檔名衝突時應加後綴"""
+        ts = datetime(2023, 7, 15, tzinfo=timezone.utc).timestamp()
+        # 已有一個正常的 20230715.txt
+        self._write_file("20230715.txt", "existing", mtime=ts)
+        # 另一個無意義檔名也需要改為同日期
+        self._write_file("1.txt", "other", mtime=ts)
+
+        json_path = self._make_report([])  # 空組，僅 all-files 模式會掃全目錄
+
+        clean(
+            target_dir=self.test_dir,
+            json_path=json_path,
+            auto_yes=True,
+            do_date_rename=True,
+            date_rename_scope="all-files",
+        )
+
+        # 原本的 20230715.txt 不變
+        assert os.path.isfile(os.path.join(self.test_dir, "20230715.txt"))
+        # "1.txt" 應改為 20230715_1.txt
+        assert os.path.isfile(os.path.join(self.test_dir, "20230715_1.txt"))
+
+    def test_phase_c_kept_only_skips_unrelated_files_by_default(self):
+        """Phase C 預設 kept-only，不應改名非 duplicates keep 檔案"""
+        ts = datetime(2023, 7, 15, tzinfo=timezone.utc).timestamp()
+        self._write_file("1.txt", "other", mtime=ts)
+        json_path = self._make_report([])
+
+        clean(
+            target_dir=self.test_dir,
+            json_path=json_path,
+            auto_yes=True,
+            do_date_rename=True,
+        )
+
+        assert os.path.isfile(os.path.join(self.test_dir, "1.txt"))
+        assert not os.path.exists(os.path.join(self.test_dir, "20230715.txt"))
+
+    def test_phase_c_all_files_can_rename_unrelated_files(self):
+        """Phase C 在 all-files 模式應可改名非 duplicates keep 檔案"""
+        ts = datetime(2023, 7, 15, tzinfo=timezone.utc).timestamp()
+        self._write_file("1.txt", "other", mtime=ts)
+        json_path = self._make_report([])
+
+        clean(
+            target_dir=self.test_dir,
+            json_path=json_path,
+            auto_yes=True,
+            do_date_rename=True,
+            date_rename_scope="all-files",
+        )
+
+        assert not os.path.exists(os.path.join(self.test_dir, "1.txt"))
+        assert os.path.isfile(os.path.join(self.test_dir, "20230715.txt"))
+
+    def test_phase_c_all_files_excludes_custom_backup_dir(self):
+        """Phase C(all-files) 應排除自訂 backup 目錄，避免改到備份檔"""
+        ts = datetime(2023, 7, 15, tzinfo=timezone.utc).timestamp()
+        self._write_file("1.txt", "same", mtime=ts)
+        self._write_file("sub/2.txt", "same", mtime=ts)
+        json_path = self._make_report([
+            {
+                "hash": "abc",
+                "keep": {"path": "1.txt", "size": 4},
+                "delete": [{"path": "sub/2.txt", "size": 4}],
+            }
+        ])
+        backup_dir = os.path.join(self.test_dir, "my_backup")
+
+        clean(
+            target_dir=self.test_dir,
+            json_path=json_path,
+            backup_dir=backup_dir,
+            auto_yes=True,
+            do_rename=False,
+            do_date_rename=True,
+            date_rename_scope="all-files",
+        )
+
+        # keep 檔可以被 Phase C 改名
+        assert os.path.isfile(os.path.join(self.test_dir, "20230715.txt"))
+        # backup 內原始檔名應保持不變，不可被 Phase C 處理
+        assert os.path.isfile(os.path.join(backup_dir, "sub", "2.txt"))
+        assert not os.path.exists(os.path.join(backup_dir, "sub", "20230715.txt"))
+
+    def test_phase_c_invalid_scope_raises(self):
+        """date_rename_scope 非法值應拋出 InvalidParameterError"""
+        json_path = self._make_report([])
+
+        with pytest.raises(InvalidParameterError, match="date_rename_scope"):
+            clean(
+                target_dir=self.test_dir,
+                json_path=json_path,
+                auto_yes=True,
+                do_date_rename=True,
+                date_rename_scope="invalid-scope",
+            )
+
+    def test_phase_labels_are_dynamic_when_phase_b_disabled(self, caplog):
+        """停用 Phase B 時，步驟標題應為 [1/2] 與 [2/2]"""
+        ts = datetime(2023, 7, 15, tzinfo=timezone.utc).timestamp()
+        self._write_file("1.txt", "same", mtime=ts)
+        self._write_file("sub/dup.txt", "same", mtime=ts)
+        json_path = self._make_report([
+            {
+                "hash": "abc",
+                "keep": {"path": "1.txt", "size": 4},
+                "delete": [{"path": "sub/dup.txt", "size": 4}],
+            }
+        ])
+
+        with caplog.at_level(logging.INFO):
+            clean(
+                target_dir=self.test_dir,
+                json_path=json_path,
+                auto_yes=True,
+                do_rename=False,
+                do_date_rename=True,
+            )
+
+        out = caplog.text
+        assert "[1/2] Moving duplicates to backup..." in out
+        assert "[2/2] Phase C: date rename + earliest mtime..." in out
+        assert "[3/3]" not in out
+
+    def test_phase_c_progress_log_is_emitted(self, caplog, monkeypatch):
+        """Phase C 應輸出進度 log（all-files 模式）"""
+        ts = datetime(2023, 7, 15, tzinfo=timezone.utc).timestamp()
+        for i in range(3):
+            self._write_file(f"{i + 1}.txt", "same", mtime=ts)
+
+        json_path = self._make_report([])
+        monkeypatch.setattr("photo_dedup.cleaner.PROGRESS_LOG_INTERVAL", 1)
+
+        with caplog.at_level(logging.INFO):
+            clean(
+                target_dir=self.test_dir,
+                json_path=json_path,
+                auto_yes=True,
+                do_date_rename=True,
+                date_rename_scope="all-files",
+            )
+
+        assert "Phase C processed" in caplog.text
+
+    def test_phase_c_kept_only_warns_when_keep_file_missing(self, caplog):
+        """kept-only 若 keep 檔不存在，應輸出 warning 而非靜默跳過"""
+        ts = datetime(2023, 7, 15, tzinfo=timezone.utc).timestamp()
+        self._write_file("sub/dup.txt", "same", mtime=ts)
+        json_path = self._make_report([
+            {
+                "hash": "abc",
+                "keep": {"path": "missing.txt", "size": 4},
+                "delete": [{"path": "sub/dup.txt", "size": 4}],
+            }
+        ])
+
+        with caplog.at_level(logging.WARNING):
+            clean(
+                target_dir=self.test_dir,
+                json_path=json_path,
+                auto_yes=True,
+                do_rename=False,
+                do_date_rename=True,
+                date_rename_scope="kept-only",
+            )
+
+        assert "Phase C skipped missing keep file" in caplog.text
 
 
 # ── Hasher 行為 ─────────────────────────────────

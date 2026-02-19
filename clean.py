@@ -71,6 +71,21 @@ Examples:
         help="Don't rename kept files to more readable names / 不改名保留檔案",
     )
     parser.add_argument(
+        "--no-date-rename",
+        action="store_true",
+        help="Skip Phase C: don't rename meaningless filenames to dates "
+             "or update mtime / 不改無意義檔名為日期格式",
+    )
+    parser.add_argument(
+        "--date-rename-scope",
+        choices=["kept-only", "all-files"],
+        default="kept-only",
+        help=(
+            "Phase C scope: 'kept-only' (default, safer) or "
+            "'all-files' (scan all files under --dir except backup)"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Preview only, don't actually move or rename files / 預覽模式",
@@ -106,6 +121,8 @@ Examples:
                 json_path=args.report,
                 backup_dir=args.backup,
                 do_rename=not args.no_rename,
+                do_date_rename=not args.no_date_rename,
+                date_rename_scope=args.date_rename_scope,
                 dry_run=args.dry_run,
                 auto_yes=args.yes,
                 force_mismatch=args.force,

@@ -29,3 +29,8 @@ class PathTraversalError(PhotoDedupError):
 class DirectoryMismatchError(PhotoDedupError):
     """掃描報告的 target_dir 與 clean 的 --dir 不一致"""
     pass
+
+
+class InvalidParameterError(PhotoDedupError):
+    """函式/CLI 呼叫參數無效"""
+    pass

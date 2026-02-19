@@ -72,6 +72,8 @@ python clean.py --dir <DIR> [options]
 | `--report`, `-r` | Path to `duplicates_data.json` |
 | `--backup`, `-b` | Backup directory (default: `<dir>/_duplicates_backup`) |
 | `--no-rename` | Skip renaming kept files |
+| `--no-date-rename` | Skip Phase C date rename + mtime update |
+| `--date-rename-scope` | Phase C scope: `kept-only` (default) or `all-files` |
 | `--dry-run` | Preview mode, no file system changes |
 | `--yes`, `-y` | Skip interactive confirmation (for automation) |
 | `--undo` | Undo previous cleanup using the transaction log |
@@ -100,6 +102,7 @@ Other files (.mp4 .mov .gif .3gp etc.)
 | **Dir mismatch check** | Verifies report's target\_dir matches `--dir` (override with `--force`) |
 | **Backup structure** | Preserves original directory structure in backup folder |
 | **Transaction log** | Every move/rename is recorded, with fsync every 50 ops; supports `--undo` |
+| **Phase C scope control** | Default `kept-only` only touches duplicate-group keep files; `all-files` is opt-in |
 | **Dry run** | `--dry-run` makes zero file system changes (no dirs created) |
 | **Input validation** | Checks directory existence and permissions upfront |
 | **Memory limit** | MAX\_IMAGE\_PIXELS = 60MP (~180MB max per image) |

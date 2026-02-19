@@ -3,6 +3,9 @@
 from . import __version__
 
 VERSION = __version__
+DEFAULT_BACKUP_DIR_NAME = "_duplicates_backup"
+CORE_SKIP_DIR_NAMES = frozenset({".git", "__pycache__"})
+SCAN_SKIP_DIR_NAMES = CORE_SKIP_DIR_NAMES | frozenset({DEFAULT_BACKUP_DIR_NAME})
 
 
 def format_size(size_bytes: int) -> str:

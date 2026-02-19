@@ -20,7 +20,7 @@ from typing import NamedTuple
 
 from .exceptions import AccessDeniedError, DirectoryNotFoundError
 from .hasher import IMAGE_EXTENSIONS, compute_hash, init_heic_support
-from .utils import VERSION, format_size
+from .utils import SCAN_SKIP_DIR_NAMES, VERSION, format_size
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ def collect_files(
             files: list of FileEntry(path, size, ext)
             errors: list of error messages for skipped files
     """
-    skip_dirs = {'_duplicates_backup', '.git', '__pycache__'}
+    skip_dirs = SCAN_SKIP_DIR_NAMES
     all_files: list[FileEntry] = []
     errors: list[str] = []
 
