@@ -127,6 +127,10 @@ python -m ruff check .
 
 Automated tests cover path safety, naming strategy, scanner behavior, and end-to-end cleanup/undo flow.
 
+## Release
+
+Push a version tag like `v1.4.1` and GitHub Actions will auto-create (or update) a GitHub Release with generated release notes.
+
 ## Requirements
 
 - Python 3.10+

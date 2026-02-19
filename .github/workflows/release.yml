@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.4.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  create-or-update-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or update GitHub Release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const manualTag = core.getInput("tag");
+            const pushTag = context.ref?.startsWith("refs/tags/")
+              ? context.ref.replace("refs/tags/", "")
+              : "";
+            const tag = manualTag || pushTag;
+
+            if (!tag) {
+              core.setFailed("No tag provided. Use tag push or workflow_dispatch input.");
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            let existingRelease = null;
+            try {
+              existingRelease = await github.rest.repos.getReleaseByTag({
+                owner,
+                repo,
+                tag,
+              });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+
+            if (!existingRelease) {
+              const created = await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                name: tag,
+                draft: false,
+                prerelease: false,
+                generate_release_notes: true,
+              });
+              core.info(`Created release: ${created.data.html_url}`);
+              return;
+            }
+
+            const updated = await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: existingRelease.data.id,
+              tag_name: tag,
+              name: tag,
+              draft: false,
+              prerelease: false,
+              generate_release_notes: true,
+            });
+            core.info(`Updated release: ${updated.data.html_url}`);
