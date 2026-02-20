@@ -1,9 +1,10 @@
 """
 檔案 hash 計算模組
 
-提供兩種 hash 策略：
+提供三種 hash 策略：
   - 全檔 MD5：適用非圖片檔
   - 像素 MD5：用 Pillow 解碼後比對像素資料，忽略 EXIF / ICC profile 差異
+  - 感知雜湊 (dHash)：縮圖後差分比對，跨解析度偵測相似圖片
 
 安全措施：
   - 限制最大圖片像素數，超過上限自動 fallback 到全檔 MD5
@@ -25,6 +26,18 @@ IMAGE_EXTENSIONS = frozenset({'.jpg', '.jpeg', '.png', '.heic', '.webp', '.dng'}
 # Pillow 的 tobytes() 會一次載入整張圖的 RGB 資料，
 # 無法真正串流讀取，因此用此上限控制記憶體用量。
 MAX_IMAGE_PIXELS = 60_000_000
+
+# --- 感知雜湊 (dHash) 相關常數 ---
+# dHash 尺寸：hash_size=16 → 產出 16×16=256-bit hash
+DHASH_SIZE = 16
+
+# Hamming distance 門檻（256-bit hash 下）
+# 同張圖不同解析度 / JPEG 重壓通常 < 15；20 留些餘裕
+HAMMING_THRESHOLD = 20
+
+# RMS 像素差門檻（0-255 scale）
+# JPEG 重壓 + resize 的 RMS 通常在 2-6，8.0 留些餘裕
+RMS_THRESHOLD = 8.0
 
 
 class HashResult(NamedTuple):
@@ -157,6 +170,132 @@ def compute_hash(filepath: str, ext: str, use_pixel: bool = True) -> str:
         return str(get_pixel_hash(filepath))
     else:
         return f"FILE:{get_file_md5(filepath)}"
+
+
+def get_dhash(filepath: str, hash_size: int = DHASH_SIZE) -> bytes:
+    """
+    計算圖片的 difference hash (dHash)。
+
+    將圖片縮放到 (hash_size+1, hash_size) 灰階後，
+    比較相鄰像素的亮度差異，產出固定長度的 hash。
+    天然具備 resolution-invariance，適合跨解析度比對。
+
+    Args:
+        filepath: 圖片路徑
+        hash_size: hash 邊長，產出 hash_size² bits
+
+    Returns:
+        packed bytes (hash_size² // 8 bytes)
+
+    Raises:
+        Exception: 圖片無法開啟或解碼時
+    """
+    import numpy as np
+    from PIL import Image, ImageOps
+
+    with Image.open(filepath) as img:
+        width, height = img.size
+        pixel_count = width * height
+        if pixel_count > MAX_IMAGE_PIXELS:
+            raise ValueError(
+                f"Image too large for dHash ({pixel_count:,} px): "
+                f"{os.path.basename(filepath)}"
+            )
+
+        img_normalized = ImageOps.exif_transpose(img)
+        try:
+            img_small = img_normalized.resize(
+                (hash_size + 1, hash_size), Image.LANCZOS,
+            ).convert('L')
+        finally:
+            if img_normalized is not img:
+                img_normalized.close()
+            del img_normalized
+
+    pixels = np.asarray(img_small, dtype=np.int16)
+    del img_small
+
+    # 水平差分：右邊像素 > 左邊像素 → 1, 否則 → 0
+    diff = (pixels[:, 1:] > pixels[:, :-1]).flatten()
+
+    # pack bool array → bytes
+    # numpy packbits 輸出 big-endian bit order
+    packed = np.packbits(diff).tobytes()
+    return packed
+
+
+def hamming_distance(a: bytes, b: bytes) -> int:
+    """
+    計算兩個 bytes 的 Hamming distance (不同 bit 數)。
+
+    使用整數 XOR + popcount，效率高。
+    """
+    int_a = int.from_bytes(a, byteorder='big')
+    int_b = int.from_bytes(b, byteorder='big')
+    return (int_a ^ int_b).bit_count()
+
+
+def compute_rms_difference(
+    path_a: str,
+    path_b: str,
+    target_size: tuple[int, int] = (256, 256),
+) -> float:
+    """
+    計算兩張圖片 resize 到相同尺寸後的 RMS 像素差。
+
+    兩張圖各自做 EXIF transpose → resize → RGB，
+    然後計算 per-pixel RMS difference。
+
+    Args:
+        path_a: 第一張圖路徑
+        path_b: 第二張圖路徑
+        target_size: 統一的目標尺寸 (width, height)
+
+    Returns:
+        RMS 值 (0-255 scale)。0 = 完全相同，值越大差異越大。
+        任一張開圖失敗 → float('inf')（安全預設：不合併）
+    """
+    import numpy as np
+    from PIL import Image, ImageOps
+
+    def _load_resized(path: str) -> np.ndarray:
+        with Image.open(path) as img:
+            width, height = img.size
+            pixel_count = width * height
+            if pixel_count > MAX_IMAGE_PIXELS:
+                raise ValueError(
+                    f"Image too large for RMS comparison ({pixel_count:,} px): "
+                    f"{os.path.basename(path)}"
+                )
+            img_normalized = ImageOps.exif_transpose(img)
+            try:
+                img_resized = img_normalized.resize(
+                    target_size, Image.LANCZOS,
+                ).convert('RGB')
+            finally:
+                if img_normalized is not img:
+                    img_normalized.close()
+                del img_normalized
+        arr = np.asarray(img_resized, dtype=np.float64)
+        del img_resized
+        return arr
+
+    try:
+        arr_a = _load_resized(path_a)
+        arr_b = _load_resized(path_b)
+    except Exception as e:
+        logger.warning(
+            "RMS comparison failed: %s vs %s (%s)",
+            os.path.basename(path_a),
+            os.path.basename(path_b),
+            e,
+        )
+        return float('inf')
+
+    diff = arr_a - arr_b
+    rms = float(np.sqrt(np.mean(diff * diff)))
+    del arr_a, arr_b, diff
+    return rms
 
 
 def init_heic_support() -> bool:

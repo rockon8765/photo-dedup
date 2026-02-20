@@ -7,6 +7,7 @@ Find and remove duplicate photos in your Google Photos backup (or any photo dire
 ## Features
 
 - **Pixel-level comparison** — Compares decoded pixel data for images, ignoring EXIF/metadata differences
+- **Cross-resolution matching** — Hybrid mode uses dHash + RMS validation to catch resized/compressed copies (for example, LINE-transcoded photos)
 - **Recursive scanning** — Scans all subdirectories by default
 - **Smart file retention** — Keeps the largest file in each duplicate group (preserves the most complete metadata)
 - **Readable rename** — Renames kept files to the most human-readable name (preserves original extension)
@@ -60,6 +61,9 @@ python scan.py --dir <DIR> [options]
 | `--no-pixel` | Use file-level MD5 instead of pixel comparison (faster but less accurate) |
 | `--no-recursive` | Only scan the top-level directory, skip subdirectories |
 | `--strict-verify` | Byte-verify `FILE:` hash matches (slower, safer against false positives) |
+| `--image-match` | Image mode: `exact` (pixel MD5), `similar` (dHash+RMS), `hybrid` (default) |
+| `--hamming-threshold` | dHash Hamming threshold for `similar`/`hybrid` (default: `20`) |
+| `--rms-threshold` | RMS threshold for stage-2 validation in `similar`/`hybrid` (default: `8.0`) |
 
 ### `clean.py` — Safe Deletion + Rename
 
@@ -86,9 +90,19 @@ python clean.py --dir <DIR> [options]
 
 ```
 Image files (.jpg .jpeg .png .heic .webp .dng)
-  → Decode with Pillow → Convert to RGB → MD5 of pixel bytes
-  → Ignores EXIF, ICC profiles, thumbnails, compression differences
-  → Images > 60MP auto-fallback to file MD5 (memory safety)
+  Mode: exact
+    → Decode with Pillow → Convert to RGB → MD5 of pixel bytes
+    → Ignores EXIF orientation/metadata differences
+    → Images > 60MP auto-fallback to file MD5 (memory safety)
+
+  Mode: similar
+    → Stage 1: dHash (perceptual hash) + Hamming threshold
+    → Stage 2: RMS pixel-difference verification (reduces false positives)
+    → Can detect resized / recompressed copies
+
+  Mode: hybrid (default)
+    → Run exact first (high precision)
+    → Then run similar to catch remaining cross-resolution copies
 
 Other files (.mp4 .mov .gif .3gp etc.)
   → Pre-filter by file size (different size = not duplicate)
@@ -132,12 +146,13 @@ Automated tests cover path safety, naming strategy, scanner behavior, and end-to
 
 ## Release
 
-Push a version tag like `v1.4.1` and GitHub Actions will auto-create (or update) a GitHub Release with generated release notes.
+Push a version tag like `v2.0.0` and GitHub Actions will auto-create (or update) a GitHub Release with generated release notes.
 
 ## Requirements
 
 - Python 3.10+
 - [Pillow](https://python-pillow.org/) — Image processing
+- [NumPy](https://numpy.org/) — dHash/RMS image similarity computations
 - [pillow-heif](https://github.com/bigcat88/pillow_heif) — HEIC/HEIF support *(optional)*
 
 ## License

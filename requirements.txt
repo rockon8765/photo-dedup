@@ -1,4 +1,5 @@
 Pillow>=10.0.0
+numpy>=1.24.0
 
 # Optional: HEIC/HEIF support (Apple photos)
 # Install with: pip install pillow-heif

@@ -77,8 +77,39 @@ Examples:
             "(slower, safer) / 對 FILE hash 命中做逐位元組驗證"
         ),
     )
+    parser.add_argument(
+        "--image-match",
+        choices=["exact", "similar", "hybrid"],
+        default="hybrid",
+        help=(
+            "Image matching mode: "
+            "'exact' (pixel MD5, same resolution only), "
+            "'similar' (perceptual hash, cross-resolution), "
+            "'hybrid' (exact first, then similar for remaining). "
+            "Default: hybrid / 圖片比對模式"
+        ),
+    )
+    parser.add_argument(
+        "--hamming-threshold",
+        type=int,
+        default=None,
+        help="dHash Hamming distance threshold for similar mode (default: 20)",
+    )
+    parser.add_argument(
+        "--rms-threshold",
+        type=float,
+        default=None,
+        help="RMS pixel difference threshold (0-255) for similar mode (default: 8.0)",
+    )
 
     args = parser.parse_args()
+
+    # 組裝 similar 相關參數（只傳有值的，讓 scan() 用預設值）
+    extra_kwargs = {}
+    if args.hamming_threshold is not None:
+        extra_kwargs["hamming_threshold"] = args.hamming_threshold
+    if args.rms_threshold is not None:
+        extra_kwargs["rms_threshold"] = args.rms_threshold
 
     try:
         scan(
@@ -87,6 +118,8 @@ Examples:
             use_pixel=not args.no_pixel,
             recursive=not args.no_recursive,
             strict_verify=args.strict_verify,
+            image_match=args.image_match,
+            **extra_kwargs,
         )
     except PhotoDedupError as e:
         print(f"\nERROR: {e}", file=sys.stderr)

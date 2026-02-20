@@ -17,8 +17,11 @@ import tempfile
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import numpy as np
 import pytest
+from PIL import Image
 
+import photo_dedup.hasher as hasher_module
 import photo_dedup.scanner as scanner_module
 from photo_dedup.cleaner import (
     _build_fast_root_checker,
@@ -35,14 +38,29 @@ from photo_dedup.exceptions import (
     InvalidReportError,
     PathTraversalError,
 )
-from photo_dedup.hasher import IMAGE_EXTENSIONS, get_pixel_hash, init_heic_support
+from photo_dedup.hasher import (
+    HAMMING_THRESHOLD,
+    IMAGE_EXTENSIONS,
+    RMS_THRESHOLD,
+    compute_rms_difference,
+    get_dhash,
+    get_pixel_hash,
+    hamming_distance,
+    init_heic_support,
+)
 from photo_dedup.metadata import (
     generate_date_filename,
     get_earliest_date,
     get_file_date,
 )
 from photo_dedup.naming import find_best_name, is_meaningless, readability_score
-from photo_dedup.scanner import FileEntry, build_groups, collect_files, scan
+from photo_dedup.scanner import (
+    FileEntry,
+    build_groups,
+    collect_files,
+    find_similar_image_groups,
+    scan,
+)
 from photo_dedup.utils import format_size
 
 # ── 路徑安全性 ──────────────────────────────────
@@ -1670,3 +1688,264 @@ class TestScannerBehavior:
 
         assert "Progress:" in caplog.text
         assert "(100%)" in caplog.text
+
+
+# ── 相似圖片偵測 ─────────────────────────────────
+
+
+class TestSimilarImageDetection:
+    """感知雜湊 (dHash) + RMS 相似圖片偵測測試"""
+
+    @staticmethod
+    def _create_gradient_image(path, width, height, seed=0):
+        """建立一張水平漸層圖片，seed 控制色調偏移"""
+        rng = np.random.RandomState(seed)
+        # 水平漸層 + 微量隨機噪聲
+        base = np.tile(
+            np.linspace(0, 255, width, dtype=np.float64),
+            (height, 1),
+        )
+        noise = rng.normal(0, 1, (height, width))
+        channel = np.clip(base + noise + seed * 30, 0, 255).astype(np.uint8)
+        arr = np.stack([channel, channel, channel], axis=2)
+        Image.fromarray(arr, 'RGB').save(path)
+
+    def test_dhash_same_content_different_size(self, tmp_path):
+        """同張圖 resize 後 hamming distance 應很小"""
+        big = tmp_path / "big.png"
+        small = tmp_path / "small.png"
+        self._create_gradient_image(str(big), 400, 300, seed=0)
+
+        # 用 Pillow resize 產生縮小版
+        with Image.open(str(big)) as img:
+            img.resize((200, 150), Image.LANCZOS).save(str(small))
+
+        dh_big = get_dhash(str(big))
+        dh_small = get_dhash(str(small))
+        dist = hamming_distance(dh_big, dh_small)
+        assert dist < HAMMING_THRESHOLD, (
+            f"Same content different size should have low hamming distance, got {dist}"
+        )
+
+    def test_dhash_different_content_high_distance(self, tmp_path):
+        """不同圖片 hamming distance 應很大"""
+        img_a = tmp_path / "a.png"
+        img_b = tmp_path / "b.png"
+        self._create_gradient_image(str(img_a), 400, 300, seed=0)
+        self._create_gradient_image(str(img_b), 400, 300, seed=5)
+
+        dh_a = get_dhash(str(img_a))
+        dh_b = get_dhash(str(img_b))
+        dist = hamming_distance(dh_a, dh_b)
+        assert dist > HAMMING_THRESHOLD, (
+            f"Different content should have high hamming distance, got {dist}"
+        )
+
+    def test_rms_same_content_resized(self, tmp_path):
+        """同圖不同尺寸 resize 後 RMS 應很小"""
+        big = tmp_path / "big.png"
+        small = tmp_path / "small.png"
+        self._create_gradient_image(str(big), 400, 300, seed=0)
+        with Image.open(str(big)) as img:
+            img.resize((200, 150), Image.LANCZOS).save(str(small))
+
+        rms = compute_rms_difference(str(big), str(small))
+        assert rms < RMS_THRESHOLD, (
+            f"Same content resized should have low RMS, got {rms:.2f}"
+        )
+
+    def test_rms_different_content_high_value(self, tmp_path):
+        """不同圖片 RMS 應遠大於 threshold"""
+        img_a = tmp_path / "a.png"
+        img_b = tmp_path / "b.png"
+        self._create_gradient_image(str(img_a), 400, 300, seed=0)
+        self._create_gradient_image(str(img_b), 400, 300, seed=5)
+
+        rms = compute_rms_difference(str(img_a), str(img_b))
+        assert rms > RMS_THRESHOLD, (
+            f"Different content should have high RMS, got {rms:.2f}"
+        )
+
+    def test_similar_groups_connected_components_with_split(self, tmp_path):
+        """
+        A~B (close), B~C (close), A!~C (far) 時：
+        Stage 1 connected component 把 A,B,C 合在一起，
+        Stage 2 RMS 驗證應正確拆分。
+        """
+        # A: 純黑
+        a_path = str(tmp_path / "a.png")
+        Image.fromarray(
+            np.zeros((100, 100, 3), dtype=np.uint8), 'RGB'
+        ).save(a_path)
+
+        # B: 幾乎全黑（微小噪聲，dHash 跟 A 接近，RMS 跟 A 也接近）
+        b_path = str(tmp_path / "b.png")
+        rng = np.random.RandomState(42)
+        b_arr = rng.randint(0, 3, (100, 100, 3), dtype=np.uint8)
+        Image.fromarray(b_arr, 'RGB').save(b_path)
+
+        # C: 純白（dHash 跟 A/B 很不同，RMS 也很高）
+        c_path = str(tmp_path / "c.png")
+        Image.fromarray(
+            np.full((100, 100, 3), 255, dtype=np.uint8), 'RGB'
+        ).save(c_path)
+
+        candidates = [
+            FileEntry(a_path, os.path.getsize(a_path), ".png"),
+            FileEntry(b_path, os.path.getsize(b_path), ".png"),
+            FileEntry(c_path, os.path.getsize(c_path), ".png"),
+        ]
+
+        # 使用極大的 hamming threshold 強制把 A,B,C 放進同一 component
+        groups, _sizes = find_similar_image_groups(
+            candidates, hamming_threshold=999, rms_threshold=RMS_THRESHOLD,
+        )
+
+        # A 和 B 應在同一組（RMS 很小），C 應不在任何組或在不同組
+        all_members = set()
+        for paths in groups.values():
+            all_members.update(paths)
+
+        # A 和 B 應該被分到一起
+        assert a_path in all_members and b_path in all_members, (
+            "A and B should be in a similar group"
+        )
+        # C 不應跟 A/B 同組
+        for key, paths in groups.items():
+            if a_path in paths:
+                assert c_path not in paths, (
+                    "C (white) should not be in the same group as A/B (black)"
+                )
+
+    def test_hybrid_mode_finds_cross_resolution_duplicates(self, tmp_path):
+        """
+        hybrid 模式：exact 抓同解析度重複，similar 抓跨解析度重複。
+        """
+        # 建立原圖 A 和完全相同的 A' (exact match)
+        self._create_gradient_image(str(tmp_path / "a.png"), 400, 300, seed=0)
+        self._create_gradient_image(str(tmp_path / "a_copy.png"), 400, 300, seed=0)
+
+        # 建立縮小版 A_small (similar but not exact)
+        with Image.open(str(tmp_path / "a.png")) as img:
+            img.resize((200, 150), Image.LANCZOS).save(
+                str(tmp_path / "a_small.png")
+            )
+
+        scan(
+            target_dir=str(tmp_path),
+            output_dir=str(tmp_path),
+            use_pixel=True,
+            recursive=True,
+            image_match="hybrid",
+        )
+
+        json_path = tmp_path / "duplicates_data.json"
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # 應該至少有 1 個 exact group (a + a_copy)
+        # 和/或 similar group 包含 a_small
+        all_grouped_files = set()
+        for g in data["groups"]:
+            all_grouped_files.add(g["keep"]["path"])
+            for d in g["delete"]:
+                all_grouped_files.add(d["path"])
+
+        assert "a.png" in all_grouped_files or "a_copy.png" in all_grouped_files
+        assert "a_small.png" in all_grouped_files, (
+            "hybrid mode should detect cross-resolution duplicate a_small.png"
+        )
+
+    def test_exact_mode_misses_cross_resolution(self, tmp_path):
+        """exact 模式不應抓到跨解析度重複"""
+        self._create_gradient_image(str(tmp_path / "a.png"), 400, 300, seed=0)
+        with Image.open(str(tmp_path / "a.png")) as img:
+            img.resize((200, 150), Image.LANCZOS).save(
+                str(tmp_path / "a_small.png")
+            )
+
+        scan(
+            target_dir=str(tmp_path),
+            output_dir=str(tmp_path),
+            use_pixel=True,
+            recursive=True,
+            image_match="exact",
+        )
+
+        json_path = tmp_path / "duplicates_data.json"
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # exact 模式下兩張不同解析度的圖不該被分到一組
+        assert data["summary"]["duplicate_groups"] == 0, (
+            "exact mode should NOT detect cross-resolution duplicates"
+        )
+
+    def test_hybrid_merges_exact_groups_via_similar_link(self, tmp_path):
+        """
+        若高解析與低解析各自先形成 exact 群組，hybrid 仍應跨群合併為單一群組。
+        """
+        self._create_gradient_image(str(tmp_path / "orig1.png"), 400, 300, seed=0)
+        self._create_gradient_image(str(tmp_path / "orig2.png"), 400, 300, seed=0)
+
+        with Image.open(str(tmp_path / "orig1.png")) as img:
+            low = img.resize((200, 150), Image.LANCZOS)
+            low.save(str(tmp_path / "line1.png"))
+            low.save(str(tmp_path / "line2.png"))
+
+        scan(
+            target_dir=str(tmp_path),
+            output_dir=str(tmp_path),
+            use_pixel=True,
+            recursive=True,
+            image_match="hybrid",
+        )
+
+        with open(tmp_path / "duplicates_data.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        all_groups = [
+            {g["keep"]["path"], *[d["path"] for d in g["delete"]]}
+            for g in data["groups"]
+        ]
+        expected = {"orig1.png", "orig2.png", "line1.png", "line2.png"}
+        assert any(group == expected for group in all_groups)
+
+    def test_dhash_respects_max_image_pixels_limit(self, tmp_path, monkeypatch):
+        img_path = tmp_path / "large.png"
+        Image.new("RGB", (8, 8), color=(0, 0, 0)).save(img_path)
+
+        monkeypatch.setattr(hasher_module, "MAX_IMAGE_PIXELS", 16)
+        with pytest.raises(ValueError, match="Image too large for dHash"):
+            get_dhash(str(img_path))
+
+    def test_rms_returns_inf_when_image_exceeds_pixel_limit(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        a = tmp_path / "a.png"
+        b = tmp_path / "b.png"
+        Image.new("RGB", (8, 8), color=(0, 0, 0)).save(a)
+        Image.new("RGB", (8, 8), color=(1, 1, 1)).save(b)
+
+        monkeypatch.setattr(hasher_module, "MAX_IMAGE_PIXELS", 16)
+        assert compute_rms_difference(str(a), str(b)) == float("inf")
+
+    def test_scan_rejects_negative_similarity_threshold(self, tmp_path):
+        with pytest.raises(InvalidParameterError, match="hamming_threshold"):
+            scan(
+                target_dir=str(tmp_path),
+                output_dir=str(tmp_path),
+                image_match="similar",
+                hamming_threshold=-1,
+            )
+
+    def test_scan_rejects_negative_rms_threshold(self, tmp_path):
+        with pytest.raises(InvalidParameterError, match="rms_threshold"):
+            scan(
+                target_dir=str(tmp_path),
+                output_dir=str(tmp_path),
+                image_match="similar",
+                rms_threshold=-0.1,
+            )

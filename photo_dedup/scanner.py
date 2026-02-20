@@ -6,7 +6,7 @@
   2. 用 os.walk (遞迴) 或 os.scandir (平面) 收集所有檔案
   3. 非圖片檔按大小分組預篩（大小不同不可能重複）
   4. 非圖片先做 partial hash，再對候選做全檔 MD5
-  5. 計算 hash（圖片: 像素 MD5 / 其他: 全檔 MD5）
+  5. 圖片依模式比對（exact/similar/hybrid），其他檔案做全檔 MD5
   6. 產出 JSON 結構化報告 + 可讀文字報告
 """
 
@@ -14,16 +14,21 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import NamedTuple
 
-from .exceptions import AccessDeniedError, DirectoryNotFoundError
+from .exceptions import AccessDeniedError, DirectoryNotFoundError, InvalidParameterError
 from .hasher import (
+    HAMMING_THRESHOLD,
     IMAGE_EXTENSIONS,
+    RMS_THRESHOLD,
     compute_hash,
+    compute_rms_difference,
+    get_dhash,
     get_file_partial_md5,
+    hamming_distance,
     init_heic_support,
 )
 from .utils import SCAN_SKIP_DIR_NAMES, VERSION, format_size
@@ -215,14 +220,217 @@ def _files_identical(path_a: str, path_b: str, chunk_size: int = 65536) -> bool:
         return False
 
 
+def _dhash_one(path: str) -> tuple[str, bytes] | None:
+    """Worker for perceptual hash (dHash) computation."""
+    try:
+        return (path, get_dhash(path))
+    except Exception as e:
+        logger.error("dHash failed: %s: %s", os.path.basename(path), e)
+        return None
+
+
+class _BKTree:
+    """
+    BK-tree for Hamming distance search on fixed-length byte hashes.
+
+    This avoids O(n²) pairwise comparisons for large image sets.
+    """
+
+    def __init__(self, hashes: list[bytes]):
+        self.hashes = hashes
+        self.root: int | None = None
+        self.children: dict[int, dict[int, int]] = defaultdict(dict)
+
+    def insert(self, idx: int) -> None:
+        if self.root is None:
+            self.root = idx
+            return
+
+        node = self.root
+        while node is not None:
+            dist = hamming_distance(self.hashes[idx], self.hashes[node])
+            next_node = self.children[node].get(dist)
+            if next_node is None:
+                self.children[node][dist] = idx
+                return
+            node = next_node
+
+    def search(self, idx: int, radius: int) -> list[int]:
+        """
+        Find neighbor node indices whose Hamming distance <= radius.
+
+        Note: if the query index has already been inserted into the tree,
+        this result may include `idx` itself. Callers should filter self-hits.
+        """
+        if self.root is None:
+            return []
+
+        query = self.hashes[idx]
+        found: list[int] = []
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            dist = hamming_distance(query, self.hashes[node])
+            if dist <= radius:
+                found.append(node)
+
+            lower = dist - radius
+            upper = dist + radius
+            for edge_dist, child in self.children.get(node, {}).items():
+                if lower <= edge_dist <= upper:
+                    stack.append(child)
+
+        return found
+
+
+def _find_connected_components(
+    adjacency: dict[int, set[int]],
+    n: int,
+) -> list[list[int]]:
+    """BFS 取 connected components。"""
+    visited = [False] * n
+    components: list[list[int]] = []
+
+    for start in range(n):
+        if visited[start]:
+            continue
+
+        component = []
+        queue = deque([start])
+        visited[start] = True
+        while queue:
+            node = queue.popleft()
+            component.append(node)
+            for neighbor in adjacency.get(node, set()):
+                if not visited[neighbor]:
+                    visited[neighbor] = True
+                    queue.append(neighbor)
+        components.append(component)
+
+    return components
+
+
+def find_similar_image_groups(
+    image_candidates: list[FileEntry],
+    hamming_threshold: int = HAMMING_THRESHOLD,
+    rms_threshold: float = RMS_THRESHOLD,
+) -> tuple[dict[str, list[str]], dict[str, int]]:
+    """
+    用感知雜湊 (dHash) 找出跨解析度的相似圖片。
+
+    Stage 1: 計算 dHash → BK-tree 半徑搜尋建圖 → connected components
+    Stage 2: component 內 pairwise RMS 驗證 → 代表者模式分子群
+
+    Args:
+        image_candidates: 要比對的圖片清單
+        hamming_threshold: Hamming distance 門檻
+        rms_threshold: RMS 像素差門檻 (0-255 scale)
+
+    Returns:
+        (hash_groups, size_map)
+        hash_groups key 格式: "SIMILAR:group_N"
+    """
+    if not image_candidates:
+        return {}, {}
+
+    # Stage 1: 計算 dHash
+    logger.info(
+        "  Similar image detection: computing dHash for %d images...",
+        len(image_candidates),
+    )
+    dhashes: list[tuple[str, bytes, int]] = []  # (path, dhash, original_size)
+
+    with ThreadPoolExecutor() as pool:
+        results = pool.map(
+            _dhash_one,
+            [e.path for e in image_candidates],
+        )
+        for entry, result in zip(image_candidates, results):
+            if result is not None:
+                path, dh = result
+                dhashes.append((path, dh, entry.size))
+            # dHash 失敗的圖片直接跳過（不參與相似比對）
+
+    n = len(dhashes)
+    if n < 2:
+        return {}, {}
+
+    # BK-tree radius search → adjacency list
+    adjacency: dict[int, set[int]] = defaultdict(set)
+    hash_values = [item[1] for item in dhashes]
+    tree = _BKTree(hash_values)
+    for i in range(n):
+        for j in tree.search(i, hamming_threshold):
+            if j == i:
+                continue
+            adjacency[i].add(j)
+            adjacency[j].add(i)
+        tree.insert(i)
+
+    # BFS connected components
+    components = _find_connected_components(adjacency, n)
+
+    # Stage 2: component 內 RMS 驗證
+    hash_groups: dict[str, list[str]] = {}
+    size_map: dict[str, int] = {}
+    group_counter = 0
+
+    for component in components:
+        if len(component) < 2:
+            continue
+
+        # 代表者模式分子群（同 strict_verify 邏輯）
+        subgroups: list[list[int]] = []
+        for idx in component:
+            assigned = False
+            for subgroup in subgroups:
+                rep_idx = subgroup[0]
+                rms = compute_rms_difference(
+                    dhashes[idx][0], dhashes[rep_idx][0],
+                )
+                if rms <= rms_threshold:
+                    subgroup.append(idx)
+                    assigned = True
+                    break
+            if not assigned:
+                subgroups.append([idx])
+
+        # 只保留 >= 2 張的子群
+        for subgroup in subgroups:
+            if len(subgroup) < 2:
+                continue
+            group_counter += 1
+            key = f"SIMILAR:group_{group_counter}"
+            paths = [dhashes[idx][0] for idx in subgroup]
+            hash_groups[key] = paths
+            for idx in subgroup:
+                size_map[dhashes[idx][0]] = dhashes[idx][2]
+
+    if group_counter > 0:
+        logger.info(
+            "  Found %d similar image group(s)",
+            group_counter,
+        )
+
+    return hash_groups, size_map
+
+
 def compute_hashes(
     image_candidates: list[FileEntry],
     non_image_candidates: list[FileEntry],
     use_pixel: bool,
+    image_match: str = "hybrid",
+    hamming_threshold: int = HAMMING_THRESHOLD,
+    rms_threshold: float = RMS_THRESHOLD,
 ) -> tuple[dict[str, list[str]], dict[str, int]]:
     """
     計算所有候選檔案的 hash。
-    圖片檔使用 ProcessPoolExecutor (CPU-bound)。
+
+    圖片比對模式 (image_match):
+      - "exact":   像素 MD5（現有行為，不跨解析度）
+      - "similar": 感知雜湊 dHash + RMS 驗證（跨解析度）
+      - "hybrid":  先 exact，未命中的殘餘圖片再走 similar
+
     非圖片檔採兩階段：
       1) partial hash 預篩（ThreadPool）
       2) 只有 size+partial 命中的檔案才做 full MD5（ThreadPool）
@@ -283,15 +491,14 @@ def compute_hashes(
                 _partial_hash_one,
                 [e.path for e in non_image_candidates],
             )
-
-        for entry, result in zip(non_image_candidates, partial_results):
-            if result is None:
-                errors += 1
-            else:
-                _, partial_hash = result
-                partial_groups[(entry.size, partial_hash)].append(entry)
-            processed += 1
-            _log_progress()
+            for entry, result in zip(non_image_candidates, partial_results):
+                if result is None:
+                    errors += 1
+                else:
+                    _, partial_hash = result
+                    partial_groups[(entry.size, partial_hash)].append(entry)
+                processed += 1
+                _log_progress()
 
         full_hash_candidates: list[FileEntry] = []
         for files in partial_groups.values():
@@ -313,21 +520,121 @@ def compute_hashes(
                 results = pool.map(_hash_one, args_list)
             _process_results(results, full_hash_candidates)
 
-    # 圖片: CPU-bound, 用 ProcessPoolExecutor
+    # 圖片處理：依 image_match 模式分流
     if image_candidates:
-        args_list = [(e.path, e.ext, use_pixel) for e in image_candidates]
-        try:
-            with ProcessPoolExecutor() as pool:
-                results = pool.map(_hash_one, args_list, chunksize=8)
-            _process_results(results, image_candidates)
-        except Exception:
-            # ProcessPoolExecutor 可能在某些環境下失敗，fallback 到序列
-            logger.warning(
-                "ProcessPool failed, falling back to sequential",
-                exc_info=True,
+        if image_match == "similar":
+            # 全部走感知雜湊
+            similar_groups, similar_sizes = find_similar_image_groups(
+                image_candidates, hamming_threshold, rms_threshold,
             )
-            results = (_hash_one(a) for a in args_list)
-            _process_results(results, image_candidates)
+            hash_groups.update(similar_groups)
+            size_map.update(similar_sizes)
+            processed += len(image_candidates)
+
+        elif image_match == "hybrid":
+            # Step 1: 先做 exact pixel hash
+            args_list = [(e.path, e.ext, use_pixel) for e in image_candidates]
+            try:
+                with ProcessPoolExecutor() as pool:
+                    results = pool.map(_hash_one, args_list, chunksize=8)
+                _process_results(results, image_candidates)
+            except Exception:
+                logger.warning(
+                    "ProcessPool failed, falling back to sequential",
+                    exc_info=True,
+                )
+                results = (_hash_one(a) for a in args_list)
+                _process_results(results, image_candidates)
+
+            # Step 2: 收集未命中的殘餘圖片 + exact 組代表者
+            matched_paths: set[str] = set()
+            exact_group_reps: dict[str, str] = {}  # rep_path → hash_key
+            for h, files in hash_groups.items():
+                if not h.startswith("FILE:") and len(files) >= 2:
+                    matched_paths.update(files)
+                    exact_group_reps[files[0]] = h
+
+            remaining = [
+                e for e in image_candidates
+                if e.path not in matched_paths
+            ]
+
+            # 加入 exact 組代表者，讓 similar 階段能跨解析度配對
+            rep_entries = [
+                e for e in image_candidates
+                if e.path in exact_group_reps
+            ]
+            similar_candidates = remaining + rep_entries
+
+            if len(similar_candidates) >= 2:
+                logger.info(
+                    "  Hybrid: %d images unmatched by exact "
+                    "(+ %d exact-group reps), running similar detection...",
+                    len(remaining),
+                    len(rep_entries),
+                )
+                similar_groups, similar_sizes = find_similar_image_groups(
+                    similar_candidates, hamming_threshold, rms_threshold,
+                )
+
+                # 合併規則：
+                # 1) similar 組含 exact reps → 合併 reps 所在 exact 組，再加入新成員
+                # 2) pure similar 組（無 exact rep）→ 新增為 SIMILAR 群組
+                for sim_key, sim_paths in similar_groups.items():
+                    reps_in_group = [
+                        p for p in sim_paths if p in exact_group_reps
+                    ]
+                    new_members = [
+                        p for p in sim_paths if p not in exact_group_reps
+                    ]
+
+                    if reps_in_group:
+                        base_key = exact_group_reps[reps_in_group[0]]
+                        base_members = hash_groups[base_key]
+
+                        # 先把其他 reps 的 exact 組併到 base
+                        for rep_path in reps_in_group[1:]:
+                            other_key = exact_group_reps[rep_path]
+                            if other_key == base_key:
+                                continue
+                            for member_path in hash_groups.get(other_key, []):
+                                if member_path not in base_members:
+                                    base_members.append(member_path)
+
+                            for rep, key in list(exact_group_reps.items()):
+                                if key == other_key:
+                                    exact_group_reps[rep] = base_key
+                            hash_groups.pop(other_key, None)
+
+                        # 再把 similar 新成員併入 base
+                        for p in new_members:
+                            if p not in base_members:
+                                base_members.append(p)
+                            size_map[p] = similar_sizes.get(p, size_map.get(p, 0))
+                    else:
+                        # 純新 similar 組，直接加入
+                        unique_paths: list[str] = []
+                        for p in sim_paths:
+                            if p not in unique_paths:
+                                unique_paths.append(p)
+                        hash_groups[sim_key] = unique_paths
+                        for p in unique_paths:
+                            size_map[p] = similar_sizes[p]
+
+        else:
+            # "exact": 現有 pixel hash 行為
+            args_list = [(e.path, e.ext, use_pixel) for e in image_candidates]
+            try:
+                with ProcessPoolExecutor() as pool:
+                    results = pool.map(_hash_one, args_list, chunksize=8)
+                _process_results(results, image_candidates)
+            except Exception:
+                logger.warning(
+                    "ProcessPool failed, falling back to sequential",
+                    exc_info=True,
+                )
+                results = (_hash_one(a) for a in args_list)
+                _process_results(results, image_candidates)
 
     _log_progress(force=True)
     elapsed = time.time() - start_time
@@ -511,6 +818,9 @@ def scan(
     use_pixel: bool = True,
     recursive: bool = True,
     strict_verify: bool = False,
+    image_match: str = "hybrid",
+    hamming_threshold: int = HAMMING_THRESHOLD,
+    rms_threshold: float = RMS_THRESHOLD,
 ):
     """
     主掃描流程。
@@ -521,6 +831,9 @@ def scan(
         use_pixel: 是否使用像素比對 (預設 True)
         recursive: 是否遞迴掃描子資料夾 (預設 True)
         strict_verify: 是否對 FILE hash 命中做 byte-by-byte 最終確認
+        image_match: 圖片比對模式 ("exact", "similar", "hybrid")
+        hamming_threshold: dHash Hamming distance 門檻
+        rms_threshold: RMS 像素差門檻 (0-255)
 
     Raises:
         DirectoryNotFoundError: 目標資料夾不存在
@@ -535,11 +848,31 @@ def scan(
 
     # 驗證參數（會拋出自訂例外）
     validate_scan_args(target_dir, output_dir)
+    if image_match not in {"exact", "similar", "hybrid"}:
+        raise InvalidParameterError(
+            f"Invalid image_match: {image_match}. "
+            "Must be one of: exact, similar, hybrid"
+        )
+    if hamming_threshold < 0:
+        raise InvalidParameterError("hamming_threshold must be >= 0")
+    if rms_threshold < 0:
+        raise InvalidParameterError("rms_threshold must be >= 0")
+
+    # --no-pixel 時圖片不走專屬流程，統一當檔案 MD5 比對。
+    if not use_pixel and image_match != "exact":
+        logger.warning(
+            "use_pixel=False overrides image_match=%s to exact (file MD5 mode)",
+            image_match,
+        )
+        image_match = "exact"
 
     settings = {
         "use_pixel": use_pixel,
         "recursive": recursive,
         "strict_verify": strict_verify,
+        "image_match": image_match,
+        "hamming_threshold": hamming_threshold,
+        "rms_threshold": rms_threshold,
     }
 
     logger.info("=" * 50)
@@ -548,6 +881,7 @@ def scan(
     logger.info("Target:    %s", target_dir)
     logger.info("Output:    %s", output_dir)
     logger.info("Mode:      %s", 'Pixel comparison' if use_pixel else 'File MD5 only')
+    logger.info("Image match: %s", image_match)
     logger.info("Recursive: %s", 'Yes' if recursive else 'No')
     logger.info("Strict verify FILE hash: %s", 'Yes' if strict_verify else 'No')
 
@@ -582,7 +916,13 @@ def scan(
     image_candidates, non_image_candidates = categorize_files(all_files, use_pixel)
 
     total_to_hash = len(image_candidates) + (len(non_image_candidates) * 2)
-    logger.info("  Images (pixel hash): %d", len(image_candidates))
+    if image_match == "similar":
+        image_mode_label = "similar matching"
+    elif image_match == "hybrid":
+        image_mode_label = "hybrid matching"
+    else:
+        image_mode_label = "exact pixel hash"
+    logger.info("  Images (%s): %d", image_mode_label, len(image_candidates))
     logger.info(
         "  Non-images (size-matched candidates): %d",
         len(non_image_candidates),
@@ -600,7 +940,10 @@ def scan(
     # Step 3
     logger.info("[3/4] Computing hashes...")
     hash_groups, size_map = compute_hashes(
-        image_candidates, non_image_candidates, use_pixel
+        image_candidates, non_image_candidates, use_pixel,
+        image_match=image_match,
+        hamming_threshold=hamming_threshold,
+        rms_threshold=rms_threshold,
     )
 
     if strict_verify:
